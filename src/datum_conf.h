@@ -114,6 +114,7 @@ typedef struct {
 	
 	char stratum_v1_listen_addr[128];
 	int stratum_v1_listen_port;
+	int stratum_v1_listen_backlog;
 	int stratum_v1_max_clients;
 	int stratum_v1_max_threads;
 	int stratum_v1_max_clients_per_thread;

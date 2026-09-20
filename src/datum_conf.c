@@ -88,6 +88,8 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "listen_port",				.description = "Listening port for Stratum Gateway",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.stratum_v1_listen_port, 				.default_int = 23334 },
+	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "listen_backlog",			.description = "listen(2) accept-queue depth on the Stratum sockets. Not the connected-client cap. Kernel may clamp to somaxconn. Minimum 1.",
+		.required = false, .ptr = &datum_config.stratum_v1_listen_backlog, 			.default_int = 20 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "max_clients_per_thread",	.description = "Maximum clients per Stratum server thread",
 		.required = false, .ptr = &datum_config.stratum_v1_max_clients_per_thread, 		.default_int = 128 },
 	{ .var_type = DATUM_CONF_INT, 		.category = "stratum", 		.name = "max_threads",				.description = "Maximum Stratum server threads",
