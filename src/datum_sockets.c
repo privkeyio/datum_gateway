@@ -196,37 +196,46 @@ void *datum_threadpool_thread(void *arg) {
 		my->empty_request = false;
 		// Call application specific thread preloop
 		if (my->app->loop_func) my->app->loop_func(my);
-		
-		// TODO: make this smarter
-		// See if there's anything to write for any of our clients before looping through all potential clients.
-		// Will need profiling, as this is pretty cheap to do with reasonable max_clients_thread.
-		// If there's data, attempt to send it.
-		for (j = 0; j < my->app->max_clients_thread; j++) {
-			if ((my->client_data[j].fd != 0) && (my->client_data[j].out_buf > 0)) {
-				int sent = send(my->client_data[j].fd, my->client_data[j].w_buffer, my->client_data[j].out_buf, MSG_DONTWAIT);
-				if (sent > 0) {
-					if (sent < my->client_data[j].out_buf) {
-						// not a full send. shift remaining data to beginning of w_buffer
-						memmove(my->client_data[j].w_buffer, my->client_data[j].w_buffer + sent, my->client_data[j].out_buf - sent);
-					}
-					if (sent <= my->client_data[j].out_buf) {
-						my->client_data[j].out_buf -= sent;
-					} else {
-						// should never happen
-						my->client_data[j].out_buf = 0;
-					}
+
+		// Only clients with queued output. Empty list means no send work this pass.
+		for (int n = 0; n < my->pending_writes; ) {
+			j = my->write_list[n];
+			if (j < 0 || j >= my->app->max_clients_thread ||
+			    my->client_data[j].fd == 0 || my->client_data[j].out_buf <= 0) {
+				my->write_list[n] = my->write_list[--my->pending_writes];
+				continue;
+			}
+			int sent = send(my->client_data[j].fd, my->client_data[j].w_buffer, my->client_data[j].out_buf, MSG_DONTWAIT);
+			if (sent > 0) {
+				if (sent < my->client_data[j].out_buf) {
+					// not a full send. shift remaining data to beginning of w_buffer
+					memmove(my->client_data[j].w_buffer, my->client_data[j].w_buffer + sent, my->client_data[j].out_buf - sent);
+				}
+				if (sent <= my->client_data[j].out_buf) {
+					my->client_data[j].out_buf -= sent;
 				} else {
-					if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
-						epoll_ctl(my->epollfd, EPOLL_CTL_DEL, my->client_data[j].fd, NULL);
-						close(my->client_data[j].fd);
-						
-						// call closed client function, if any
-						if (my->app->closed_client_func) my->app->closed_client_func(&my->client_data[j], "send error");
-						
-						datum_socket_thread_client_count_decrement(my, j, true);
-					}
+					// should never happen
+					my->client_data[j].out_buf = 0;
+				}
+				if (my->client_data[j].out_buf <= 0) {
+					my->client_data[j].out_buf = 0;
+					my->write_list[n] = my->write_list[--my->pending_writes];
+					continue;
+				}
+			} else {
+				if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
+					epoll_ctl(my->epollfd, EPOLL_CTL_DEL, my->client_data[j].fd, NULL);
+					close(my->client_data[j].fd);
+
+					// call closed client function, if any
+					if (my->app->closed_client_func) my->app->closed_client_func(&my->client_data[j], "send error");
+
+					// drops this cid from write_list, so the slot at n is a different client
+					datum_socket_thread_client_count_decrement(my, j, true);
+					continue;
 				}
 			}
+			n++;
 		}
 		
 		// check if we have any data to read from any existing clients
@@ -377,6 +386,7 @@ void clean_thread_data(T_DATUM_THREAD_DATA *d, T_DATUM_SOCKET_APP *app) {
 	
 	d->connected_clients = 0;
 	d->next_open_client_index = 0;
+	d->pending_writes = 0;
 	
 	d->has_new_clients = false;
 	
@@ -809,20 +819,26 @@ bool datum_socket_setoptions(int sock) {
 
 int datum_socket_send_string_to_client(T_DATUM_CLIENT_DATA *c, char *s) {
 	int len = strlen(s);
+	int was;
 	if (!len) return 0;
 	if ((c->out_buf + len) >= CLIENT_BUFFER) return -1;
+	was = c->out_buf;
 	strncpy(&c->w_buffer[c->out_buf], s, CLIENT_BUFFER-(c->out_buf)-1);
 	c->out_buf += len;
+	if (was == 0) datum_socket_note_pending_write(c->datum_thread, c->cid);
 	return len;
 }
 
 int datum_socket_send_chars_to_client(T_DATUM_CLIENT_DATA *c, char *s, int len) {
+	int was;
 	if (!len) return 0;
 	if ((c->out_buf + len) >= CLIENT_BUFFER) return -1;
 	if (len > (CLIENT_BUFFER-(c->out_buf)-1)) {
 		len = CLIENT_BUFFER-(c->out_buf)-1;
 	}
+	was = c->out_buf;
 	memcpy(&c->w_buffer[c->out_buf], s, len);
 	c->out_buf += len;
+	if (was == 0) datum_socket_note_pending_write(c->datum_thread, c->cid);
 	return len;
 }
