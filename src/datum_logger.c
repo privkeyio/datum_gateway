@@ -410,16 +410,9 @@ void * datum_logger_thread(void *ptr) {
 			ets = 0;
 		}
 		
-		if (ets < 56999) {
-			j = (57000 - ets) / 1000;
-			j++;
-			for(i=0;i<j;i++) {
-				if (panic_mode) {
-					i = j;
-				} else {
-					usleep(1000);
-				}
-			}
+		if (ets < 57000 && !panic_mode) {
+		    struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)(57000 - ets) * 1000L };
+		    nanosleep(&ts, NULL);
 		}
 	}
 	return NULL;
