@@ -64,7 +64,7 @@
 // an incompatible trailer layout requires a new DRS version.
 #define DATUM_DRS_RESUME_TOKEN_FLAG 0x01
 #define DATUM_DRS_FRAMING_V2_FLAG 0x02
-/* Gateway offers this when coinbaser_reuse is on. The pool acks it.
+/* Gateway always offers this. The pool acks it.
  * Old pools ignore the bit. No ack means do not scale an old split. */
 #define DATUM_DRS_SCALED_REUSE_FLAG 0x04
 

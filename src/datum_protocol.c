@@ -1988,10 +1988,9 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 
-	/* datum.coinbaser_reuse defaults off. On: after 500ms with no matching
-	 * answer, publish a stretched copy of the last multi-out list. Off: wait
-	 * the stock 5s and return whatever the pool sent, including a short list. */
-	const bool reuse_on = datum_config.datum_coinbaser_reuse;
+	/* Always. A short list is not published. A stretch still requires the
+	 * pool's hello ack, which try_reuse checks. */
+	const bool reuse_on = true;
 	if (reuse_on) {
 		/* A late answer for exactly this tip and value may already be saved;
 		 * it is the pool's own split, so no new request is needed. */
@@ -3040,7 +3039,7 @@ int datum_protocol_send_hello(int sockfd) {
 	memcpy(&hello_msg[i], "DRS\x01", 4); i += 4;
 	datum_requested_resume = datum_has_resume_token;
 	uint8_t drs_flags = DATUM_DRS_FRAMING_V2_FLAG | (datum_requested_resume ? DATUM_DRS_RESUME_TOKEN_FLAG : 0);
-	if (datum_config.datum_coinbaser_reuse) drs_flags |= DATUM_DRS_SCALED_REUSE_FLAG;
+	drs_flags |= DATUM_DRS_SCALED_REUSE_FLAG;
 	hello_msg[i++] = drs_flags;
 	if (datum_requested_resume) {
 		memcpy(&hello_msg[i], datum_resume_token, DATUM_RESUME_TOKEN_SIZE);
@@ -3200,7 +3199,7 @@ int datum_protocol_handshake_response(T_DATUM_PROTOCOL_HEADER *h, unsigned char 
 		const unsigned char *selection = &motd_end[1];
 		const size_t selection_len = (size_t)(&data[h->cmd_len] - selection);
 		if (selection_len >= 1 && (selection[0] & DATUM_DRS_FRAMING_V2_FLAG)) framing_v2 = true;
-		if (selection_len >= 1 && datum_config.datum_coinbaser_reuse &&
+		if (selection_len >= 1 &&
 		    (selection[0] & DATUM_DRS_SCALED_REUSE_FLAG)) scaled_reuse = true;
 	}
 	if (motd_end) motd_len = (size_t)(motd_end - &data[i]);
@@ -3214,9 +3213,7 @@ int datum_protocol_handshake_response(T_DATUM_PROTOCOL_HEADER *h, unsigned char 
 	sodium_memzero(&precomp, sizeof(precomp));
 	datum_framing_v2 = framing_v2;
 	atomic_store(&datum_pool_scaled_reuse_ok, scaled_reuse);
-	if (datum_config.datum_coinbaser_reuse) {
-		DLOG_INFO("DATUM Pool scaled reuse:    %s", scaled_reuse ? "ok" : "no");
-	}
+	DLOG_INFO("DATUM Pool scaled reuse:    %s", scaled_reuse ? "ok" : "no");
 	datum_state = 2; //we're handshaked with encryption setup!
 	
 	DLOG_DEBUG("Handshake response received.");

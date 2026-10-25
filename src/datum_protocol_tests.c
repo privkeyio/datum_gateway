@@ -2314,7 +2314,7 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 1);
 	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 2);
 	{
-		// Work on tip_b pays mining.pool_address unless pooled_mining_only is set.
+		// Work on tip_b pays mining.pool_address. pooled_mining_only does not change that.
 		const int saved_active = atomic_load(&datum_protocol_client_active);
 		unsigned char notice[36] = { DATUM_ABW_DRAFT_REVISION, DATUM_ABW_ASSIGNMENT_ACTIVE, 0 };
 		memset(notice + 3, 0x5a, 32);
@@ -2335,8 +2335,8 @@ static void datum_coinbaser_prev_block_tests(void) {
 		datum_protocol_coinbaser_prev_record(tip_d, -1);
 		datum_test(!datum_prev_test_base_is_datum(tip_d));
 		datum_config.datum_pooled_mining_only = true;
-		datum_test(datum_prev_test_base_is_datum(tip_b));
-		datum_test(datum_prev_test_base_is_datum(tip_d));
+		datum_test(!datum_prev_test_base_is_datum(tip_b));
+		datum_test(!datum_prev_test_base_is_datum(tip_d));
 		datum_config.datum_pooled_mining_only = false;
 		datum_protocol_coinbaser_prev_record(tip_b, 2);
 		datum_protocol_abw_reset();

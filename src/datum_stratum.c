@@ -2070,7 +2070,7 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	 * the previous-block check, so the saved split is never stretched onto a
 	 * tip whose previous block the pool found. A slower check leaves the job
 	 * solo (when allowed) until it ends or the pool answers. */
-	if (new_block && datum_config.datum_coinbaser_reuse && datum_protocol_is_active()) {
+	if (new_block && datum_protocol_is_active()) {
 		datum_protocol_coinbaser_prev_check(s->prevhash_bin, 50);
 	}
 
@@ -2084,7 +2084,7 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	 * job. The coinbase classes carry the template's witness commitment, so
 	 * they are never paired with the empty (subsidy-only) work. The pool's
 	 * own answer replaces this on the job that follows. */
-	if (datum_config.datum_coinbaser_reuse && s->is_new_block && s->is_datum_job) {
+	if (s->is_new_block && s->is_datum_job) {
 		if (datum_protocol_coinbaser_try_reuse(s) >= 2) {
 			generate_coinbase_txns_for_stratum_job(s, false);
 			s->provisional_split = true;
