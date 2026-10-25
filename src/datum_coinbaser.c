@@ -422,13 +422,13 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		datum_config.mining_pool_address[0];
 	const bool no_split = solo_allowed && !datum_protocol_coinbaser_have_saved();
 	const int prev_solo = (solo_allowed && !no_split) ? datum_protocol_coinbaser_prev_solo(s->prevhash_bin) : 0;
-	/* No hello ack: Fly's wait. Solo until this tip's own split, no scaled list.
-	 * ABW: same solo, even when the pool acked, because a stretch is masked. */
+	/* No hello ack: solo until this tip's own split, no scaled list.
+	 * ABW uses that same solo, even when the pool acked, because a stretch
+	 * is masked. Require mode does not take it: solo_allowed is false. */
 	const bool scale_solo = solo_allowed && !no_split && !prev_solo &&
 		!datum_protocol_scaled_reuse_ok() &&
 		!datum_protocol_coinbaser_exact_ready(s);
-	const bool abw_solo = datum_protocol_is_active() &&
-		datum_config.mining_pool_address[0] &&
+	const bool abw_solo = solo_allowed &&
 		s->block_template && s->block_template->abw_enabled &&
 		!datum_protocol_coinbaser_exact_ready(s);
 	const bool solo_until_first_split = no_split || prev_solo || scale_solo || abw_solo;

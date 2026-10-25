@@ -2267,11 +2267,12 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 }
 
 /* Builds the base coinbase for a job on tip; returns whether it pays the pool. */
-static bool datum_prev_test_base_is_datum(const unsigned char *tip) {
+static bool datum_prev_test_base_is_datum(const unsigned char *tip, bool abw) {
 	static T_DATUM_TEMPLATE_DATA tdata;
 	static T_DATUM_STRATUM_JOB base;
 	memset(&tdata, 0, sizeof(tdata));
 	memset(&base, 0, sizeof(base));
+	tdata.abw_enabled = abw;
 	tdata.sizelimit = 4000000;
 	tdata.weightlimit = 4000000;
 	tdata.sigoplimit = 80000;
@@ -2353,16 +2354,18 @@ static void datum_coinbaser_prev_block_tests(void) {
 		strcpy(datum_config.mining_pool_address, "1BoatSLRHtKNngkdXEeobR76b53LETtpyT");
 		datum_config.override_mining_pool_scriptpubkey[0] = 0x51;
 		datum_config.override_mining_pool_scriptpubkey_len = 1;
-		datum_test(!datum_prev_test_base_is_datum(tip_b));
+		datum_test(!datum_prev_test_base_is_datum(tip_b, false));
 		// unverified, then not the pool's, then unreadable
-		datum_test(!datum_prev_test_base_is_datum(tip_d));
+		datum_test(!datum_prev_test_base_is_datum(tip_d, false));
 		datum_protocol_coinbaser_prev_record(tip_d, 1);
-		datum_test(datum_prev_test_base_is_datum(tip_d));
+		datum_test(datum_prev_test_base_is_datum(tip_d, false));
 		datum_protocol_coinbaser_prev_record(tip_d, -1);
-		datum_test(!datum_prev_test_base_is_datum(tip_d));
+		datum_test(!datum_prev_test_base_is_datum(tip_d, false));
+		datum_test(!datum_prev_test_base_is_datum(tip_b, true));
 		datum_config.datum_pooled_mining_only = true;
-		datum_test(datum_prev_test_base_is_datum(tip_b));
-		datum_test(datum_prev_test_base_is_datum(tip_d));
+		datum_test(datum_prev_test_base_is_datum(tip_b, false));
+		datum_test(datum_prev_test_base_is_datum(tip_d, false));
+		datum_test(datum_prev_test_base_is_datum(tip_b, true));
 		datum_config.datum_pooled_mining_only = false;
 		datum_protocol_coinbaser_prev_record(tip_b, 2);
 		datum_protocol_abw_reset();

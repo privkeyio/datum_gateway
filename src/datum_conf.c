@@ -200,7 +200,7 @@ const T_DATUM_CONFIG_ITEM datum_config_options[] = {
 	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "pooled_mining_only",			.description = "If the DATUM pool server becomes unavailable, terminate miner connections (otherwise, 100% of any blocks you find pay mining.pool_address)",
 		.example_default = true,
 		.required = false, .ptr = &datum_config.datum_pooled_mining_only, 	.default_bool = true },
-	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse",			.description = "Ignored. A saved split is scaled only when the pool's hello acknowledgement says so. With pooled_mining_only off, work pays mining.pool_address until that split. With it on and no acknowledgement, the gateway waits like stock.",
+	{ .var_type = DATUM_CONF_BOOL, 		.category = "datum", 		.name = "coinbaser_reuse",			.description = "Ignored. A saved split is scaled only when the pool's hello acknowledgement says so. With pooled_mining_only off, work pays mining.pool_address until that split, including on an ABW template. With it on, the gateway waits like stock.",
 		.example_default = false,
 		.required = false, .ptr = &datum_config.datum_coinbaser_reuse, 	.default_bool = false },
 	{ .var_type = DATUM_CONF_INT, 		.category = "datum", 		.name = "protocol_global_timeout",		.description = "If no valid messages are received from the DATUM server in this many seconds, give up and try to reconnect",
