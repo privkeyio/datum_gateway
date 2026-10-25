@@ -137,6 +137,7 @@ static void datum_protocol_hello_framing_offer_tests(void) {
 			datum_test(!memcmp(p, "DRS\x01", 4));
 			p = &p[4];
 			datum_test((*p & DATUM_DRS_FRAMING_V2_FLAG) != 0);
+			datum_test((*p & DATUM_DRS_SCALED_REUSE_FLAG) != 0);
 		}
 	}
 	datum_test(!datum_framing_v2);
@@ -231,6 +232,26 @@ static void datum_protocol_handshake_bounds_tests(void) {
 	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
 	datum_test(datum_state == 2);
 	datum_test(datum_framing_v2);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_state = 1;
+	datum_protocol_test_scaled_reuse(true);
+	clear[193] = DATUM_DRS_FRAMING_V2_FLAG | DATUM_DRS_SCALED_REUSE_FLAG;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(datum_state == 2);
+	datum_test(datum_framing_v2);
+	datum_test(datum_protocol_scaled_reuse_ok());
+	datum_state = 1;
+	clear[193] = DATUM_DRS_SCALED_REUSE_FLAG;
+	datum_framing_v2 = false;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(datum_protocol_scaled_reuse_ok());
+	datum_test(!datum_framing_v2);
+	datum_state = 1;
+	clear[193] = DATUM_DRS_FRAMING_V2_FLAG;
+	datum_test(datum_protocol_test_receive_sealed(clear, 194, &pool_keys) == 1);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_test(datum_framing_v2);
+	datum_protocol_test_scaled_reuse(false);
 	datum_state = 1;
 	datum_framing_v2 = false;
 	clear[194] = 0xa5;
@@ -243,6 +264,8 @@ static void datum_protocol_handshake_bounds_tests(void) {
 	datum_test(datum_protocol_test_receive_sealed(clear, 195, &pool_keys) == 1);
 	datum_test(datum_state == 2);
 	datum_test(!datum_framing_v2);
+	datum_test(!datum_protocol_scaled_reuse_ok());
+	datum_protocol_test_scaled_reuse(false);
 	
 	sodium_memzero(&remote, sizeof(remote));
 	local_datum_keys = saved_local;
@@ -1096,6 +1119,7 @@ static void datum_coinbaser_reuse_pool_and_late_tests(void) {
 	datum_test(datum_protocol_coinbaser_take_late(got) == 0);
 
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
 	datum_config.prime_id = saved_prime;
 }
 
@@ -1172,6 +1196,7 @@ static void datum_coinbaser_reuse_same_tip_tests(void) {
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 0);
 
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
 }
 
 static void datum_protocol_migration_tests(void) {
@@ -2233,6 +2258,7 @@ static void datum_coinbaser_prev_block_fetch_tests(void) {
 
 	datum_prev_check_wait(NULL);
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
 	atomic_store(&datum_protocol_client_active, saved_active);
 	server_out_buf = saved_out;
 	sending_header_key = saved_header_key;
@@ -2314,7 +2340,7 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(datum_protocol_coinbaser_prev_solo(tip_b) == 1);
 	datum_test(datum_protocol_coinbaser_prev_solo(tip_c) == 2);
 	{
-		// Work on tip_b pays mining.pool_address. pooled_mining_only does not change that.
+		// Work on tip_b pays mining.pool_address unless pooled_mining_only is set.
 		const int saved_active = atomic_load(&datum_protocol_client_active);
 		unsigned char notice[36] = { DATUM_ABW_DRAFT_REVISION, DATUM_ABW_ASSIGNMENT_ACTIVE, 0 };
 		memset(notice + 3, 0x5a, 32);
@@ -2335,8 +2361,8 @@ static void datum_coinbaser_prev_block_tests(void) {
 		datum_protocol_coinbaser_prev_record(tip_d, -1);
 		datum_test(!datum_prev_test_base_is_datum(tip_d));
 		datum_config.datum_pooled_mining_only = true;
-		datum_test(!datum_prev_test_base_is_datum(tip_b));
-		datum_test(!datum_prev_test_base_is_datum(tip_d));
+		datum_test(datum_prev_test_base_is_datum(tip_b));
+		datum_test(datum_prev_test_base_is_datum(tip_d));
 		datum_config.datum_pooled_mining_only = false;
 		datum_protocol_coinbaser_prev_record(tip_b, 2);
 		datum_protocol_abw_reset();
@@ -2454,6 +2480,7 @@ static void datum_coinbaser_prev_block_tests(void) {
 	datum_test(datum_protocol_coinbaser_try_reuse(&job) == 3);
 
 	datum_protocol_coinbaser_reuse_reset();
+	datum_protocol_test_scaled_reuse(false);
 	datum_config = saved_config;
 }
 

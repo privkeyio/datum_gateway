@@ -1988,9 +1988,11 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 
-	/* Always. A short list is not published. A stretch still requires the
-	 * pool's hello ack, which try_reuse checks. */
-	const bool reuse_on = true;
+	/* Require mode with no hello ack waits like stock: 5s, and a short list
+	 * is kept. Otherwise a short list is not published. try_reuse still
+	 * refuses a stretch unless the pool acked. */
+	const bool reuse_on = !datum_config.datum_pooled_mining_only ||
+		datum_protocol_scaled_reuse_ok();
 	if (reuse_on) {
 		/* A late answer for exactly this tip and value may already be saved;
 		 * it is the pool's own split, so no new request is needed. */

@@ -412,13 +412,13 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 	int cb2idx[1] = { 0 };
 	int target_pot_index;
 	
-	/* While the pool is connected, a pooled job is built only from a split
-	 * this pool issued. Before the first one, and whenever a saved split
-	 * must not be scaled, the job pays mining.pool_address instead of the
-	 * pool's script alone. The coinbaser thread still asks the pool, and
-	 * replaces this work once it answers. The hello ack is what allows a
-	 * stretch. Reward-sharing mode does not choose this coinbase. */
+	/* While the pool is connected and pooled_mining_only is off, a job pays
+	 * mining.pool_address until a split from this pool can be used. Require
+	 * mode does not take that solo payout: with no hello ack it waits like
+	 * stock, and with an ack it may still scale. The coinbaser thread still
+	 * asks the pool. */
 	const bool solo_allowed = datum_protocol_is_active() &&
+		!datum_config.datum_pooled_mining_only &&
 		datum_config.mining_pool_address[0];
 	const bool no_split = solo_allowed && !datum_protocol_coinbaser_have_saved();
 	const int prev_solo = (solo_allowed && !no_split) ? datum_protocol_coinbaser_prev_solo(s->prevhash_bin) : 0;
