@@ -95,12 +95,32 @@ int get_remote_ip(int fd, char *ip, size_t max_len) {
 	return 0;
 }
 
+static int datum_socket_get_wait_timeout(T_DATUM_THREAD_DATA *my) {
+	if (my->wake_fd < 0 || my->pending_writes > 0) return 7;
+	int timeout_ms = 1000;
+
+	if (my->app->wait_timeout_func) {
+        	int app_timeout = my->app->wait_timeout_func(my);
+
+		if (app_timeout >= 0 && app_timeout < timeout_ms) {
+        		timeout_ms = app_timeout;
+        	}
+    	}
+
+	return timeout_ms;
+}
+
 void *datum_threadpool_thread(void *arg) {
 	T_DATUM_THREAD_DATA *my = (T_DATUM_THREAD_DATA *)arg;
 	int i, nfds, n, cidx, j;
 	size_t leftover = 0;
 	
 	if (!my->app->client_cmd_func) {
+		atomic_store_explicit(
+			&my->worker_state,
+			DATUM_WORKER_FAILED,
+			memory_order_release
+		);
 		DLOG_FATAL("Thread pool thread started with no client command function pointer. :(");
 		panic_from_thread(__LINE__);
 		return 0;
@@ -108,29 +128,91 @@ void *datum_threadpool_thread(void *arg) {
 	
 	my->epollfd = epoll_create1(EPOLL_CLOEXEC);
 	if (my->epollfd < 0) {
+		atomic_store_explicit(
+			&my->worker_state,
+			DATUM_WORKER_FAILED,
+			memory_order_release
+		);
 		DLOG_FATAL("could not epoll_create!");
 		panic_from_thread(__LINE__);
 		return 0;
 	}
 	
+	int wake_read = -1;
+	int wake_write = -1;
+	#ifdef __linux__
+	wake_read = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (wake_read == -1) DLOG_ERROR("eventfd() failed for thread %d: %s", my->thread_id, strerror(errno));
+	wake_write = wake_read;
+	#else
+	int pipefds[2];
+	if (pipe(pipefds) == 0) {
+		wake_read = pipefds[0];
+		wake_write = pipefds[1];
+		fcntl(wake_read, F_SETFL, O_NONBLOCK);
+		fcntl(wake_write, F_SETFL, O_NONBLOCK);
+		fcntl(wake_read, F_SETFD, FD_CLOEXEC);
+		fcntl(wake_write, F_SETFD, FD_CLOEXEC);
+	} else {
+		DLOG_ERROR("Failed to create pipe fallback for wake: %s", strerror(errno));
+	}
+	#endif
+	if (wake_read >= 0) {
+		struct epoll_event wev = { .events = EPOLLIN, .data.u64 = (uint64_t)-1 };
+		if (epoll_ctl(my->epollfd, EPOLL_CTL_ADD, wake_read, &wev) < 0) {
+			DLOG_ERROR("could not add wake eventfd to epoll: %s -- falling back to timeout polling", strerror(errno));
+			close(wake_read);
+			if (wake_write != wake_read) close(wake_write);
+		} else {
+			/* Publish both ends only after epoll_ctl succeeds.
+			 * On Linux the eventfd is both ends. On other platforms
+			 * the worker reads from wake_read (held by epoll) and
+			 * wakers write to wake_write. */
+			pthread_mutex_lock(&my->wake_lock);
+			my->wake_fd = wake_read;
+			my->wake_write_fd = wake_write;
+			pthread_mutex_unlock(&my->wake_lock);
+		}
+	}
+	
 	// Call application specific thread init
 	if (my->app->init_func) my->app->init_func(my);
 	
-	while(1) {
+	atomic_store_explicit(
+		&my->worker_state,
+		DATUM_WORKER_RUNNING,
+		memory_order_release
+	);
+	
+	while(!atomic_load_explicit(
+              &my->stop_requested,
+              memory_order_acquire)) {
 		pthread_mutex_lock(&my->thread_data_lock);
 		
 		if (!my->connected_clients) {
+			atomic_exchange_explicit(&my->empty_request, false, memory_order_acq_rel);
+			atomic_exchange_explicit(&my->has_client_kill_request, false, memory_order_acq_rel);
+			
+			for (i = 0; i < my->app->max_clients_thread; i++) {
+				my->client_data[i].kill_request = false;
+			}
 			// no clients to serve
-			// shutdown this thread after some kind of timeout?
 			pthread_mutex_unlock(&my->thread_data_lock);
 			
 			// the loop doesn't care if we have no clients...
 			if (my->app->loop_func) my->app->loop_func(my);
 			
-			my->has_client_kill_request = false;
-			my->empty_request = false;
-			
-			usleep(10000);
+			if (my->wake_fd >= 0) {
+				struct epoll_event ev;
+				int nfds = epoll_wait(my->epollfd, &ev, 1, datum_socket_get_wait_timeout(my));
+				if (nfds > 0 && ev.data.u64 == (uint64_t)-1) {
+					uint64_t v;
+					while (read(my->wake_fd, &v, sizeof(v)) > 0) {}
+				}
+			}
+			else {
+				usleep(10000);
+			}
 			continue;
 		}
 		
@@ -146,7 +228,8 @@ void *datum_threadpool_thread(void *arg) {
 					// add to epoll for this thread
 					my->ev.events = EPOLLIN  | EPOLLONESHOT | EPOLLERR; // | EPOLLRDHUP
 					my->ev.data.u64 = i; // store client index... duh
-					if (epoll_ctl(my->epollfd, EPOLL_CTL_ADD, my->client_data[i].fd, &my->ev) < 0) {
+					int ctl = epoll_ctl(my->epollfd, EPOLL_CTL_ADD, my->client_data[i].fd, &my->ev);
+					if (ctl < 0) {
 						DLOG_ERROR("epoll_ctl add failed: %s", strerror(errno));
 						close(my->client_data[i].fd); // Close the file descriptor on error
 						
@@ -163,44 +246,42 @@ void *datum_threadpool_thread(void *arg) {
 			}
 			my->has_new_clients = false;
 		}
+		
+		bool empty_requested = atomic_exchange_explicit(&my->empty_request, false, memory_order_acq_rel);
+		bool kill_requested = atomic_exchange_explicit(&my->has_client_kill_request, false, memory_order_acq_rel);
 		pthread_mutex_unlock(&my->thread_data_lock);
 		
-		if (__builtin_expect(my->empty_request,0)) {
-			// We got a request to empty all clients from our thread!
-			DLOG_WARN("Executing command to empty thread (%d clients)",my->connected_clients);
+		if (__builtin_expect(empty_requested, 0)) {
+			DLOG_WARN("Executing command to empty thread (%d clients)", my->connected_clients);
 			for (j = 0; j < my->app->max_clients_thread; j++) {
 				if (my->client_data[j].fd != 0) {
 					epoll_ctl(my->epollfd, EPOLL_CTL_DEL, my->client_data[j].fd, NULL);
 					close(my->client_data[j].fd);
-					
-					// call closed client function, if any
-					if (my->app->closed_client_func) my->app->closed_client_func(&my->client_data[j], "empty thread command");
+					if (my->app->closed_client_func)
+						my->app->closed_client_func(&my->client_data[j], "empty thread command");
 					datum_socket_thread_client_count_decrement(my, j, true);
 				}
 			}
-		} else if (__builtin_expect(my->has_client_kill_request,0)) {
-			// the API has requested we kill a specific client
+		}else if (__builtin_expect(kill_requested, 0)) {
 			for (j = 0; j < my->app->max_clients_thread; j++) {
 				if ((my->client_data[j].fd != 0) && (my->client_data[j].kill_request)) {
 					my->client_data[j].kill_request = false;
 					epoll_ctl(my->epollfd, EPOLL_CTL_DEL, my->client_data[j].fd, NULL);
 					close(my->client_data[j].fd);
-					
-					// call closed client function, if any
-					if (my->app->closed_client_func) my->app->closed_client_func(&my->client_data[j], "client kill command");
+					if (my->app->closed_client_func)
+						my->app->closed_client_func(&my->client_data[j], "client kill command");
 					datum_socket_thread_client_count_decrement(my, j, true);
 				}
 			}
 		}
-		my->has_client_kill_request = false;
-		my->empty_request = false;
+
 		// Call application specific thread preloop
 		if (my->app->loop_func) my->app->loop_func(my);
 
 		datum_socket_flush_writes(my);
 		
 		// check if we have any data to read from any existing clients
-		nfds = epoll_wait(my->epollfd, my->events, MAX_EVENTS, 7);
+		nfds = epoll_wait(my->epollfd, my->events, MAX_EVENTS, datum_socket_get_wait_timeout(my));
 		if (nfds < 0) {
 			if (errno != EINTR) {
 				DLOG_ERROR("epoll_wait returned %d", nfds);
@@ -212,6 +293,11 @@ void *datum_threadpool_thread(void *arg) {
 			for(i=0;i<nfds;i++) {
 				cidx = my->events[i].data.u64;
 				
+				if (cidx == (uint64_t)-1) {
+					uint64_t v;
+					while (read(my->wake_fd, &v, sizeof(v)) > 0) {}
+					continue;
+				}
 				if (cidx >= 0) {
 					n = recv(my->client_data[cidx].fd, &my->client_data[cidx].buffer[my->client_data[cidx].in_buf], CLIENT_BUFFER - 1 - my->client_data[cidx].in_buf, MSG_DONTWAIT);
 					if (n <= 0) {
@@ -331,11 +417,42 @@ void *datum_threadpool_thread(void *arg) {
 		}
 	}
 	
+	atomic_store_explicit(&my->worker_state, DATUM_WORKER_STOPPING, memory_order_release);
+
+	for (j = 0; j < my->app->max_clients_thread; j++) {
+		if (my->client_data[j].fd != 0) {
+			epoll_ctl(my->epollfd, EPOLL_CTL_DEL, my->client_data[j].fd, NULL);
+			close(my->client_data[j].fd);
+			if (my->app->closed_client_func)
+				my->app->closed_client_func(&my->client_data[j], "worker stop");
+			datum_socket_thread_client_count_decrement(my, j, true);
+		}
+	}
+
+	pthread_mutex_lock(&my->wake_lock);
+	int read_fd = my->wake_fd;
+	int write_fd = my->wake_write_fd;
+	my->wake_fd = -1;
+	my->wake_write_fd = -1;
+	pthread_mutex_unlock(&my->wake_lock);
+	if (read_fd >= 0) close(read_fd);
+	if (write_fd >= 0 && write_fd != read_fd) close(write_fd);
+
+	if (my->epollfd >= 0) {
+		close(my->epollfd);
+		my->epollfd = -1;
+	}
+
+	atomic_store_explicit(&my->worker_state, DATUM_WORKER_STOPPED, memory_order_release);
 	return NULL;
 }
 
 void clean_thread_data(T_DATUM_THREAD_DATA *d, T_DATUM_SOCKET_APP *app) {
 	int i;
+	atomic_init(&d->worker_state, DATUM_WORKER_STARTING);
+	atomic_init(&d->stop_requested, false);
+	atomic_init(&d->empty_request, false);
+	atomic_init(&d->has_client_kill_request, false);
 	
 	// clean up clients, just in case
 	for(i=0;i<app->max_clients_thread;i++) {
@@ -344,6 +461,7 @@ void clean_thread_data(T_DATUM_THREAD_DATA *d, T_DATUM_SOCKET_APP *app) {
 		d->client_data[i].in_buf = 0;
 		d->client_data[i].out_buf = 0;
 		d->client_data[i].write_queued = false;
+		d->client_data[i].kill_request = false;
 	}
 	
 	d->connected_clients = 0;
@@ -351,7 +469,8 @@ void clean_thread_data(T_DATUM_THREAD_DATA *d, T_DATUM_SOCKET_APP *app) {
 	d->pending_writes = 0;
 	
 	d->has_new_clients = false;
-	
+	d->wake_fd = -1;
+	d->wake_write_fd = -1;
 	// clear polling events
 	// TODO: dynamic allocation of buffers
 	memset(&d->ev, 0, sizeof(struct epoll_event));
@@ -401,7 +520,8 @@ int assign_to_thread(T_DATUM_SOCKET_APP *app, int fd) {
 		app->datum_threads[tid].is_active = true;
 		app->datum_active_threads++;
 		
-		if (datum_thread_create(&app->datum_threads[i].pthread, datum_threadpool_thread, &app->datum_threads[i]) != 0) {
+		if (datum_thread_create(&app->datum_threads[tid].pthread, datum_threadpool_thread, &app->datum_threads[tid]) != 0) {
+			atomic_store_explicit(&app->datum_threads[tid].worker_state, DATUM_WORKER_FAILED, memory_order_release);
 			app->datum_active_threads--;
 			app->datum_threads[tid].is_active = false;
 			DLOG_ERROR("Could not start new thread for TID %d", tid);
@@ -512,8 +632,10 @@ int assign_to_thread(T_DATUM_SOCKET_APP *app, int fd) {
 	app->datum_threads[tid].client_data[cid].datum_thread = (void *)&app->datum_threads[tid];
 	app->datum_threads[tid].client_data[cid].in_buf = 0;
 	app->datum_threads[tid].client_data[cid].out_buf = 0;
+	app->datum_threads[tid].client_data[cid].kill_request = false;
 	app->datum_threads[tid].client_data[cid].write_queued = false;
 	app->datum_threads[tid].has_new_clients = true;
+	datum_socket_wake_thread(&app->datum_threads[tid]);
 	
 	pthread_mutex_unlock(&app->datum_threads[tid].thread_data_lock);
 	
@@ -664,6 +786,13 @@ void *datum_gateway_listener_thread(void *arg) {
 	for(i=0;i<app->max_threads;i++) {
 		ret = pthread_mutex_init(&app->datum_threads[i].thread_data_lock, NULL);
 		if (ret) {
+			DLOG_FATAL("Could not init thread data mutex: %s", strerror(ret));
+			panic_from_thread(__LINE__);
+			return NULL;
+		}
+
+		ret = pthread_mutex_init(&app->datum_threads[i].wake_lock, NULL);
+		if (ret) {
 			DLOG_FATAL("Could not init mutex for thread data: %s", strerror(ret));
 			panic_from_thread(__LINE__);
 			return NULL;
@@ -674,6 +803,8 @@ void *datum_gateway_listener_thread(void *arg) {
 		app->datum_threads[i].thread_id = i;
 		app->datum_threads[i].connected_clients = 0;
 		app->datum_threads[i].next_open_client_index = 0;
+		app->datum_threads[i].wake_fd = -1;
+		app->datum_threads[i].wake_write_fd = -1;
 	}
 	
 	app->datum_active_threads = 0;

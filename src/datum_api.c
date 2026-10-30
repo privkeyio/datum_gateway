@@ -562,7 +562,8 @@ static enum MHD_Result datum_api_asset(struct MHD_Connection * const connection,
 void datum_api_cmd_empty_thread(int tid) {
 	if (global_stratum_app && (tid >= 0) && (tid < global_stratum_app->max_threads)) {
 		DLOG_WARN("API Request to empty stratum thread %d!", tid);
-		global_stratum_app->datum_threads[tid].empty_request = true;
+		atomic_store_explicit(&global_stratum_app->datum_threads[tid].empty_request, true, memory_order_release);
+		datum_socket_wake_thread(&global_stratum_app->datum_threads[tid]);
 	}
 }
 
@@ -571,7 +572,8 @@ void datum_api_cmd_kill_client(int tid, int cid) {
 		if ((cid >= 0) && (cid < global_stratum_app->max_clients_thread)) {
 			DLOG_WARN("API Request to disconnect stratum client %d/%d!", tid, cid);
 			global_stratum_app->datum_threads[tid].client_data[cid].kill_request = true;
-			global_stratum_app->datum_threads[tid].has_client_kill_request = true;
+			atomic_store_explicit(&global_stratum_app->datum_threads[tid].has_client_kill_request, true, memory_order_release);
+			datum_socket_wake_thread(&global_stratum_app->datum_threads[tid]);
 		}
 	}
 }

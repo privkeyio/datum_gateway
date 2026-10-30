@@ -35,6 +35,7 @@ add_executable(datum_gateway
 	src/datum_protocol_tests.c
 	src/datum_queue.c
 	src/datum_sockets.c
+	src/datum_sockets_tests.c
 	src/datum_stratum.c
 	src/datum_stratum_dupes.c
 	src/datum_stratum_dupes_tests.c

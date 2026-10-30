@@ -105,6 +105,57 @@ bool stratum_latest_empty_check_ready_for_full(void) {
 	return a;
 }
 
+int datum_stratum_v1_socket_wait_timeout(T_DATUM_THREAD_DATA *my) {
+	T_DATUM_STRATUM_THREADPOOL_DATA *sdata =
+	(T_DATUM_STRATUM_THREADPOOL_DATA *)my->app_thread_data;
+
+	uint64_t now = current_time_millis();
+	uint64_t next_deadline = UINT64_MAX;
+
+	// Next staggered mining.notify.
+	if (sdata->notify_remaining_count > 0 && sdata->notify_delay_per_slot_tsms > 0) {
+		uint64_t deadline = sdata->notify_last_time + sdata->notify_delay_per_slot_tsms;
+
+		if (deadline < next_deadline) next_deadline = deadline;
+	}
+
+	// Full reblast after empty (jitter race).
+	if (sdata->full_reblast_tsms > 0 &&
+	    sdata->full_reblast_tsms < next_deadline) {
+		next_deadline = sdata->full_reblast_tsms;
+	}
+
+	// Next idle-kick check.
+	if ((datum_config.stratum_v1_idle_timeout_no_subscribe > 0) ||
+	(datum_config.stratum_v1_idle_timeout_no_share > 0) ||
+	(datum_config.stratum_v1_idle_timeout_max_last_work > 0)) {
+
+		if (sdata->next_kick_check_tsms > 0 &&
+		    sdata->next_kick_check_tsms < next_deadline) {
+			next_deadline = sdata->next_kick_check_tsms;
+		}
+	}
+
+	// Coinbaser readiness fallback.
+	// The existing readiness check expires after 5000 ms.
+	if (sdata->new_job && sdata->cur_stratum_job &&
+	(sdata->cur_stratum_job->job_state == 4 ||
+	sdata->cur_stratum_job->job_state == 5)) {
+		uint64_t deadline = sdata->cur_stratum_job->tsms + 5001;
+
+		if (deadline < next_deadline) next_deadline = deadline;
+	}
+
+	// No scheduled work. Retain the safety catch.
+	if (next_deadline == UINT64_MAX) return 1000;
+	if (next_deadline <= now) return 0;
+
+	uint64_t remaining = next_deadline - now;
+
+	// Keep the existing 1000 ms safety catch.
+	return remaining < 1000 ? (int)remaining : 1000;
+}
+
 void datum_stratum_v1_shutdown_all(void) {
 	int ret;
 	unsigned int shutdown_threads = 0;
@@ -123,7 +174,8 @@ void datum_stratum_v1_shutdown_all(void) {
 		}
 		
 		// Send request to gracefully boot all clients from the thread
-		global_stratum_app->datum_threads[tid].empty_request = true;
+		atomic_store_explicit(&global_stratum_app->datum_threads[tid].empty_request, true, memory_order_release);
+		datum_socket_wake_thread(&global_stratum_app->datum_threads[tid]);
 		shutdown_threads++;
 		pthread_mutex_unlock(&global_stratum_app->datum_threads[tid].thread_data_lock);
 	}
@@ -165,6 +217,7 @@ void *datum_stratum_v1_socket_server(void *arg) {
 	app->client_cmd_func = datum_stratum_v1_socket_thread_client_cmd;
 	app->closed_client_func = datum_stratum_v1_socket_thread_client_closed;
 	app->new_client_func = datum_stratum_v1_socket_thread_client_new;
+	app->wait_timeout_func = datum_stratum_v1_socket_wait_timeout;
 	
 	// set listen port
 	app->listen_port = datum_config.stratum_v1_listen_port;
@@ -286,6 +339,12 @@ void *datum_stratum_v1_socket_server(void *arg) {
 				// we are done!
 				stratum_latest_empty_ready_for_full = true;
 				DLOG_INFO("Empty work send completed. Sent to %llu clients across %llu threads", (unsigned long long)stratum_latest_empty_sent_count, (unsigned long long)stratum_latest_empty_complete_count);
+				/* The threadpool threads check this flag inside their job loop.
+				 * Without a wake they sit in epoll_wait until the 1000ms timeout. */
+				for (int tid = 0; tid < app->max_threads; ++tid) {
+					if (app->datum_threads[tid].is_active)
+						datum_socket_wake_thread(&app->datum_threads[tid]);
+				}
 			}
 		}
 		pthread_rwlock_unlock(&stratum_global_latest_empty_stat);
@@ -468,6 +527,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 			sdata->notify_remaining_count = 0; // this is new work
 			sdata->full_coinbase_ready = false;
 			sdata->last_job_height = sdata->cur_stratum_job->height;
+			sdata->full_reblast_tsms = 0;
 		}
 	}
 	pthread_rwlock_unlock(&stratum_global_job_ptr_lock);
@@ -475,6 +535,17 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 	sdata->loop_tsms = current_time_millis();
 	
 	job = sdata->cur_stratum_job;
+	if (sdata->full_reblast_tsms && sdata->loop_tsms >= sdata->full_reblast_tsms) {
+		sdata->full_reblast_tsms = 0;
+		if (job && !sdata->new_job && sdata->last_sent_job_state == 2) {
+			for (i = 0; i < my->app->max_clients_thread; i++) {
+				m = my->client_data[i].app_client_data;
+				if (my->client_data[i].fd && m->subscribed)
+					send_mining_notify(&my->client_data[i],
+						datum_stratum_notify_replaces_job(job->job_state, false), false, false);
+			}
+		}
+	}
 	if (sdata->new_job) {
 		switch (job->job_state) {
 			case 1: {
@@ -528,6 +599,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 						sdata->new_job = false;
 						sdata->last_was_empty = false;
 						sdata->last_sent_job_state = 2; // probably should be different, but not sure if needed.
+						sdata->full_reblast_tsms = sdata->loop_tsms + 100;
 					}
 				}
 				break;
@@ -677,7 +749,8 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 								DLOG_DEBUG("Kicking client %d/%d (%s) for being idle > %d seconds without submitting any new shares. (connected %.2f, currently %.2f, delta %.2f)",my->thread_id, i, my->client_data[i].rem_host, datum_config.stratum_v1_idle_timeout_max_last_work, (double)m->connect_tsms / (double)1000.0, (double)sdata->loop_tsms/ (double)1000.0, (double)(sdata->loop_tsms - m->connect_tsms) / (double)1000.0);
 								// boot them!
 								my->client_data[i].kill_request = true;
-								my->has_client_kill_request = true;
+								atomic_store_explicit(&my->has_client_kill_request, true, memory_order_release);
+								datum_socket_wake_thread(my);
 							}
 						} else {
 							// no accepted shares
@@ -685,7 +758,8 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 								DLOG_DEBUG("Kicking client %d/%d (%s) for being idle > %d seconds without submitting any shares. (connected %.2f, currently %.2f, delta %.2f)",my->thread_id, i, my->client_data[i].rem_host, datum_config.stratum_v1_idle_timeout_no_share, (double)m->connect_tsms / (double)1000.0, (double)sdata->loop_tsms/ (double)1000.0, (double)(sdata->loop_tsms - m->connect_tsms) / (double)1000.0);
 								// boot them!
 								my->client_data[i].kill_request = true;
-								my->has_client_kill_request = true;
+								atomic_store_explicit(&my->has_client_kill_request, true, memory_order_release);
+								datum_socket_wake_thread(my);
 							}
 						}
 					} else {
@@ -694,7 +768,8 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 							// boot them!
 							DLOG_DEBUG("Kicking client %d/%d (%s) for being idle > %d seconds without subscribing. (connected %.2f, currently %.2f, delta %.2f)",my->thread_id, i, my->client_data[i].rem_host, datum_config.stratum_v1_idle_timeout_no_subscribe, (double)m->connect_tsms / (double)1000.0, (double)sdata->loop_tsms/ (double)1000.0, (double)(sdata->loop_tsms - m->connect_tsms) / (double)1000.0);
 							my->client_data[i].kill_request = true;
-							my->has_client_kill_request = true;
+							atomic_store_explicit(&my->has_client_kill_request, true, memory_order_release);
+							datum_socket_wake_thread(my);
 						}
 					}
 				}
@@ -1720,6 +1795,11 @@ int datum_stratum_v1_socket_thread_client_cmd(T_DATUM_CLIENT_DATA *c, char *line
 	int i;
 	uint64_t id;
 	
+	/* loop_tsms was set before the epoll_wait. Refresh here so shares
+	 * and idle checks in this command see current time*/
+	if (c && c->datum_thread && c->datum_thread->app_thread_data)
+		((T_DATUM_STRATUM_THREADPOOL_DATA *)c->datum_thread->app_thread_data)->loop_tsms = current_time_millis();
+	
 	if (line[0] == 0) return 0;
 	
 	if (line[0] != '{') {
@@ -2153,9 +2233,14 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	
 	global_cur_stratum_jobs[global_latest_stratum_job_index] = s;
 	pthread_rwlock_unlock(&stratum_global_job_ptr_lock);
-	
+	if (global_stratum_app) {
+		for (int i = 0; i < global_stratum_app->max_threads; i++) {
+			if (global_stratum_app->datum_threads[i].is_active)
+				datum_socket_wake_thread(&global_stratum_app->datum_threads[i]);
+		}
+	}
+
 	DLOG_DEBUG("Updated to job %d, ncb = %d, state = %d", s->global_index, s->need_coinbaser?1:0, s->job_state);
-	
 	return;
 }
 

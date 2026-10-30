@@ -947,6 +947,12 @@ void *datum_coinbaser_thread(void *ptr) {
 					s->need_coinbaser = false;
 					pthread_rwlock_unlock(&need_coinbaser_rwlocks[sjob]);
 					need_coinbaser = false;
+					if (global_stratum_app) {
+						for (int i = 0; i < global_stratum_app->max_threads; i++) {
+							if (global_stratum_app->datum_threads[i].is_active)
+								datum_socket_wake_thread(&global_stratum_app->datum_threads[i]);
+						}
+					}
 				}
 				DLOG_DEBUG("Generated and notified.");
 				if (datum_protocol_coinbaser_reuse_active() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {

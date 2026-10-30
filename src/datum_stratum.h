@@ -202,6 +202,7 @@ typedef struct T_DATUM_STRATUM_THREADPOOL_DATA {
 	int notify_last_cid;
 	uint64_t last_job_height;
 	uint64_t next_kick_check_tsms;
+	uint64_t full_reblast_tsms;
 	
 	char submitblock_req[MAX_SUBMITBLOCK_SIZE];
 	
@@ -320,6 +321,11 @@ extern T_DATUM_SOCKET_APP *global_stratum_app;
 
 extern pthread_rwlock_t need_coinbaser_rwlocks[MAX_STRATUM_JOBS];
 extern atomic_bool need_coinbaser_rwlocks_init_done;
+extern pthread_rwlock_t stratum_global_latest_empty_stat;
+extern uint64_t stratum_latest_empty_complete_count;
+extern bool stratum_latest_empty_ready_for_full;
+extern uint64_t stratum_latest_empty_sent_count;
+extern uint64_t stratum_latest_empty_job_index;
 
 // Gateway-local share totals from connected stratum miners (not pool responses)
 extern uint64_t stratum_client_accepted_share_count;

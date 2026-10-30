@@ -2137,9 +2137,19 @@ static bool datum_prev_test_serve(T_DATUM_PREV_TEST_SERVER *server, const unsign
 }
 
 static void datum_prev_test_unserve(T_DATUM_PREV_TEST_SERVER *server) {
-	shutdown(server->listen_fd, SHUT_RDWR); // fail, not hang, when no getblock came
-	pthread_join(server->thread, NULL);
-	close(server->listen_fd);
+        struct sockaddr_in bound;
+        socklen_t bound_len = sizeof(bound);
+        int poke = -1;
+        if (getsockname(server->listen_fd, (struct sockaddr *)&bound, &bound_len) == 0) {
+                poke = socket(AF_INET, SOCK_STREAM, 0);
+                if (poke >= 0) {
+                        connect(poke, (struct sockaddr *)&bound, bound_len);
+                        close(poke);
+                }
+        }
+        shutdown(server->listen_fd, SHUT_RDWR);
+        pthread_join(server->thread, NULL);
+        close(server->listen_fd);
 }
 
 /* Runs the check against a fake bitcoind serving block_hex for tip. */
