@@ -92,6 +92,8 @@ void datum_protocol_tests(void);
 void datum_stratum_dupes_tests(void);
 void datum_utils_tests(void);
 void datum_submitblock_tests(void);
+void datum_sockets_eventfd_tests(void);
+void datum_sockets_latency_long_test(void);
 
 static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 	struct arguments *arguments = state->input;
@@ -111,6 +113,7 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 			exit(0);
 			break;
 		case 0x101:  // test
+			datum_sockets_eventfd_tests();
 			datum_utils_tests();
 			datum_conf_tests();
 #ifdef ENABLE_API

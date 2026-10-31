@@ -572,6 +572,7 @@ void datum_api_cmd_kill_client(int tid, int cid) {
 			DLOG_WARN("API Request to disconnect stratum client %d/%d!", tid, cid);
 			global_stratum_app->datum_threads[tid].client_data[cid].kill_request = true;
 			global_stratum_app->datum_threads[tid].has_client_kill_request = true;
+			datum_socket_wake_thread(&global_stratum_app->datum_threads[tid]);
 		}
 	}
 }

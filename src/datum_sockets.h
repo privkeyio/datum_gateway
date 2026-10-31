@@ -48,6 +48,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
 
 typedef struct T_DATUM_THREAD_DATA T_DATUM_THREAD_DATA;
 typedef struct T_DATUM_CLIENT_DATA T_DATUM_CLIENT_DATA;
@@ -83,14 +84,14 @@ typedef struct T_DATUM_CLIENT_DATA {
 	
 	bool kill_request;
 	
+	bool write_queued;
+	
 	void *app_client_data;
 	
 	int proxy_line_read;
 	
 	T_DATUM_THREAD_DATA *datum_thread;
 	
-	// True while this cid is on the thread's write_list.
-	bool write_queued;
 } T_DATUM_CLIENT_DATA;
 
 typedef struct {
@@ -159,13 +160,14 @@ typedef struct T_DATUM_THREAD_DATA {
 	
 	int connected_clients;
 	int next_open_client_index;
-
+	
 	// Clients with out_buf > 0. The threadpool write pass walks this, not every slot.
 	int write_list[MAX_CLIENTS_THREAD];
 	int pending_writes;
-
+	
 	struct epoll_event ev, events[MAX_CLIENTS_THREAD*2];
 	int epollfd;
+	int wake_fd;
 	
 	// information for this socket application
 	// this is global to the socket application
@@ -186,6 +188,13 @@ int datum_socket_send_chars_to_client(T_DATUM_CLIENT_DATA *c, char *s, int len);
 
 int assign_to_thread(T_DATUM_SOCKET_APP *app, int fd);
 void *datum_threadpool_thread(void *arg);
+
+static inline void datum_socket_wake_thread(T_DATUM_THREAD_DATA *my) {
+	uint64_t one = 1;
+	if (my && my->wake_fd >= 0) {
+		(void)write(my->wake_fd, &one, sizeof(one));
+	}
+}
 
 static inline void datum_socket_note_pending_write(T_DATUM_THREAD_DATA *my, int cid) {
 	if (!my || cid < 0 || cid >= MAX_CLIENTS_THREAD) return;

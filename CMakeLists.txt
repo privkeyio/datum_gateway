@@ -35,6 +35,7 @@ add_executable(datum_gateway
 	src/datum_protocol_tests.c
 	src/datum_queue.c
 	src/datum_sockets.c
+	src/datum_sockets_tests.c
 	src/datum_stratum.c
 	src/datum_stratum_dupes.c
 	src/datum_stratum_dupes_tests.c
@@ -145,6 +146,19 @@ add_custom_target(generate_git_version
 	VERBATIM
 )
 add_dependencies(datum_gateway generate_git_version)
+
+add_executable(datum_gateway_latency src/datum_latency_test.c src/datum_sockets_tests.c)
+target_link_libraries(datum_gateway_latency PRIVATE pthread ${EPOLL_SHIM_LIBRARIES})
+add_dependencies(datum_gateway_latency generate_git_version)
+target_include_directories(datum_gateway_latency PRIVATE
+	$<BUILD_INTERFACE:${PROJECT_BINARY_DIR}>
+	${ARGP_INCLUDE_DIRS}
+	${EPOLL_SHIM_INCLUDE_DIRS}
+	${CURL_INCLUDE_DIRS}
+	${JANSSON_INCLUDE_DIRS}
+	${SODIUM_INCLUDE_DIRS}
+)
+
 
 add_custom_command(
 	OUTPUT web_resources.h

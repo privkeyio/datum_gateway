@@ -124,6 +124,7 @@ void datum_stratum_v1_shutdown_all(void) {
 		
 		// Send request to gracefully boot all clients from the thread
 		global_stratum_app->datum_threads[tid].empty_request = true;
+		datum_socket_wake_thread(&global_stratum_app->datum_threads[tid]);
 		shutdown_threads++;
 		pthread_mutex_unlock(&global_stratum_app->datum_threads[tid].thread_data_lock);
 	}
@@ -678,6 +679,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 								// boot them!
 								my->client_data[i].kill_request = true;
 								my->has_client_kill_request = true;
+								datum_socket_wake_thread(my);
 							}
 						} else {
 							// no accepted shares
@@ -686,6 +688,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 								// boot them!
 								my->client_data[i].kill_request = true;
 								my->has_client_kill_request = true;
+								datum_socket_wake_thread(my);
 							}
 						}
 					} else {
@@ -695,6 +698,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 							DLOG_DEBUG("Kicking client %d/%d (%s) for being idle > %d seconds without subscribing. (connected %.2f, currently %.2f, delta %.2f)",my->thread_id, i, my->client_data[i].rem_host, datum_config.stratum_v1_idle_timeout_no_subscribe, (double)m->connect_tsms / (double)1000.0, (double)sdata->loop_tsms/ (double)1000.0, (double)(sdata->loop_tsms - m->connect_tsms) / (double)1000.0);
 							my->client_data[i].kill_request = true;
 							my->has_client_kill_request = true;
+							datum_socket_wake_thread(my);
 						}
 					}
 				}
@@ -2153,9 +2157,14 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 	
 	global_cur_stratum_jobs[global_latest_stratum_job_index] = s;
 	pthread_rwlock_unlock(&stratum_global_job_ptr_lock);
-	
+	if (global_stratum_app) {
+		for (int i = 0; i < global_stratum_app->max_threads; i++) {
+			if (global_stratum_app->datum_threads[i].is_active)
+				datum_socket_wake_thread(&global_stratum_app->datum_threads[i]);
+		}
+	}
+
 	DLOG_DEBUG("Updated to job %d, ncb = %d, state = %d", s->global_index, s->need_coinbaser?1:0, s->job_state);
-	
 	return;
 }
 
