@@ -1557,9 +1557,13 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 	}
 	/* Exact reuse above does not need consent. A stretch needs the opt-in
 	 * and the pool's ack. An ABW stretch also needs the pool's ABW ack. */
-	if (!datum_protocol_coinbaser_reuse_active() ||
-	    (s->block_template && s->block_template->abw_enabled &&
-	     !datum_protocol_abw_scaled_reuse_ok())) {
+	if (!datum_protocol_coinbaser_reuse_active()) {
+		s->available_coinbase_outputs_count = 0;
+		return 0;
+	}
+	if (s->block_template && s->block_template->abw_enabled &&
+	    !datum_protocol_abw_scaled_reuse_ok()) {
+		DLOG_INFO("Coinbaser: ABW template and the pool has not acked ABW reuse; not stretching the split");
 		s->available_coinbase_outputs_count = 0;
 		return 0;
 	}
@@ -1584,6 +1588,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 	}
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
 	if (n < 2) {
+		DLOG_INFO("Coinbaser: no split held from this pool session; not stretching");
 		s->available_coinbase_outputs_count = 0;
 		return 0;
 	}
@@ -1603,6 +1608,7 @@ int datum_protocol_coinbaser_try_reuse(T_DATUM_STRATUM_JOB *s) {
 			uint64_t scaled = (uint64_t)(((unsigned __int128)original * new_value) / total);
 			/* 546 is the pool's agreed floor. Relay dust is policy, not consensus. */
 			if (original >= 546 && scaled < 546) {
+				DLOG_INFO("Coinbaser: stretching %" PRIu64 " -> %" PRIu64 " would put an output below 546 sats; not stretching", total, new_value);
 				s->available_coinbase_outputs_count = 0;
 				return 0;
 			}
