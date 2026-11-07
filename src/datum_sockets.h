@@ -49,7 +49,12 @@
 #include <unistd.h>
 #include <sys/socket.h>
 
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
+
 typedef struct T_DATUM_THREAD_DATA T_DATUM_THREAD_DATA;
+typedef int (*DATUM_ThreadPool_WaitTimeout_Func)(T_DATUM_THREAD_DATA *);
 typedef struct T_DATUM_CLIENT_DATA T_DATUM_CLIENT_DATA;
 
 typedef void (*DATUM_ThreadPool_Init_Func)(T_DATUM_THREAD_DATA *);
@@ -68,6 +73,14 @@ typedef void (*DATUM_ThreadPool_ClientNew_Func)(T_DATUM_CLIENT_DATA *);
 #define MAX_THREADS 64
 #define MAX_EVENTS (MAX_CLIENTS_THREAD*2)
 
+typedef enum {
+    DATUM_WORKER_STARTING = 0,
+    DATUM_WORKER_RUNNING,
+    DATUM_WORKER_STOPPING,
+    DATUM_WORKER_STOPPED,
+    DATUM_WORKER_FAILED
+} DATUM_WORKER_STATE;
+
 typedef struct T_DATUM_CLIENT_DATA {
 	bool new_connection;
 	int fd;
@@ -83,14 +96,14 @@ typedef struct T_DATUM_CLIENT_DATA {
 	
 	bool kill_request;
 	
+	bool write_queued;
+	
 	void *app_client_data;
 	
 	int proxy_line_read;
 	
 	T_DATUM_THREAD_DATA *datum_thread;
 	
-	// True while this cid is on the thread's write_list.
-	bool write_queued;
 } T_DATUM_CLIENT_DATA;
 
 typedef struct {
@@ -110,6 +123,8 @@ typedef struct {
 	
 	// Called each time a new client connects and is assigned to a threadpool thread
 	DATUM_ThreadPool_ClientNew_Func new_client_func;
+	
+	DATUM_ThreadPool_WaitTimeout_Func wait_timeout_func;
 	
 	// TCP port this server will listen on
 	int listen_port;
@@ -141,12 +156,15 @@ typedef struct {
 typedef struct T_DATUM_THREAD_DATA {
 	pthread_t pthread;
 	
+	atomic_int worker_state;
+	atomic_bool stop_requested;
+	
 	bool is_active;
 	
 	bool has_new_clients;
 	
-	bool empty_request;
-	bool has_client_kill_request;
+	atomic_bool empty_request;
+	atomic_bool has_client_kill_request;
 	
 	int thread_id;
 	//int newBlockCount;
@@ -159,13 +177,16 @@ typedef struct T_DATUM_THREAD_DATA {
 	
 	int connected_clients;
 	int next_open_client_index;
-
+	
 	// Clients with out_buf > 0. The threadpool write pass walks this, not every slot.
 	int write_list[MAX_CLIENTS_THREAD];
 	int pending_writes;
-
+	
 	struct epoll_event ev, events[MAX_CLIENTS_THREAD*2];
 	int epollfd;
+	int wake_fd;
+	int wake_write_fd;
+	pthread_mutex_t wake_lock;
 	
 	// information for this socket application
 	// this is global to the socket application
@@ -186,6 +207,37 @@ int datum_socket_send_chars_to_client(T_DATUM_CLIENT_DATA *c, char *s, int len);
 
 int assign_to_thread(T_DATUM_SOCKET_APP *app, int fd);
 void *datum_threadpool_thread(void *arg);
+
+static inline void datum_socket_wake_thread(T_DATUM_THREAD_DATA *my) {
+    uint64_t one = 1;
+
+    if (!my) return;
+
+    pthread_mutex_lock(&my->wake_lock);
+
+    if (my->wake_write_fd >= 0) {
+        while (1) {
+            ssize_t ret = write(my->wake_write_fd, &one, sizeof(one));
+
+            if (ret == (ssize_t)sizeof(one)) {
+                break;
+            }
+
+            if (ret < 0 && errno == EINTR) {
+                continue;
+            }
+
+            /*
+             * EAGAIN means the eventfd is already readable.
+             * Other errors are not recoverable here; the worker's
+             * timeout remains the fallback.
+             */
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&my->wake_lock);
+}
 
 static inline void datum_socket_note_pending_write(T_DATUM_THREAD_DATA *my, int cid) {
 	if (!my || cid < 0 || cid >= MAX_CLIENTS_THREAD) return;
