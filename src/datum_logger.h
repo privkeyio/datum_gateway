@@ -74,6 +74,7 @@ int datum_logger_queue_msg(const char *func, enum datum_loglevel level, const ch
 #define DLOG_ERROR(format, ...) datum_logger_queue_msg(__func__, DLOG_LEVEL_ERROR, format __VA_OPT__(,) __VA_ARGS__)
 #define DLOG_FATAL(format, ...) datum_logger_queue_msg(__func__, DLOG_LEVEL_FATAL, format __VA_OPT__(,) __VA_ARGS__)
 
+void datum_logger_wake(void);
 int datum_logger_init(void);
 void datum_logger_config(
 	bool clog_to_file,

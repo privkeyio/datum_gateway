@@ -47,11 +47,16 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 #include <sys/time.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <poll.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #include "datum_logger.h"
 #include "datum_utils.h"
@@ -85,6 +90,16 @@ uint64_t dlog_queue_version[2] = { 0, 10 };
 
 int msg_buf_idx[2] = { 0, 0 };
 char *msg_buffer[2] = { NULL, NULL };
+
+static int logger_wake_fd = -1;
+static int logger_wake_write_fd = -1;
+
+void datum_logger_wake(void) {
+	if (logger_wake_write_fd >= 0) {
+		uint64_t one = 1;
+		(void)write(logger_wake_write_fd, &one, sizeof(one));
+	}
+}
 
 static inline enum datum_loglevel datum_logger_clamp_loglevel(int level) {
 	if (level < 0) return 0;
@@ -232,8 +247,13 @@ int datum_logger_queue_msg(const char *func, enum datum_loglevel level, const ch
 	}
 	
 	msg_buf_idx[buffer_id] += i+2; // increment the index
+	bool was_empty = (dlog_queue_next[buffer_id] == 0);
 	dlog_queue_next[buffer_id]++; // bounds check is above, since we can potentially delay to wait for the writer instead of failing here
 	pthread_rwlock_unlock(&dlog_buffer_rwlock[buffer_id]);
+	
+	if (was_empty) {
+		datum_logger_wake();
+	}
 	
 	return 0;
 }
@@ -410,8 +430,24 @@ void * datum_logger_thread(void *ptr) {
 			ets = 0;
 		}
 		
-		if (ets < 57000 && !panic_mode) {
-			struct timespec ts = { .tv_sec = 0, .tv_nsec = (long)(57000 - ets) * 1000L };
+		// recheck: more work arrived while we drained?
+		buffer_id = dlog_active_buffer;
+		pthread_rwlock_rdlock(&dlog_buffer_rwlock[buffer_id]);
+		i = dlog_queue_next[buffer_id];
+		pthread_rwlock_unlock(&dlog_buffer_rwlock[buffer_id]);
+		if (i) continue;
+		if (panic_mode) continue;
+
+		if (logger_wake_fd >= 0) {
+			uint64_t n;
+			struct pollfd pfd = { .fd = logger_wake_fd, .events = POLLIN };
+			int pr = poll(&pfd, 1, 57);
+			if (pr > 0 && (pfd.revents & POLLIN)) {
+				while (read(logger_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+			}
+		}
+		else {
+			struct timespec ts = { .tv_sec = 0, .tv_nsec = 57000000L };
 			nanosleep(&ts, NULL);
 		}
 	}
@@ -457,6 +493,29 @@ int datum_logger_init(void) {
 			return -1;
 		}
 	}
+	
+	#ifdef __linux__
+	logger_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (logger_wake_fd < 0) {
+		DLOG_ERROR("eventfd for logger failed: %s; falling back to 57 ms sleep", strerror(errno));
+	}
+	else logger_wake_write_fd = logger_wake_fd;
+	#else
+	int pipefds[2];
+	if (pipe(pipefds) != 0) {
+		DLOG_ERROR("pipe for logger failed: %s; falling back to 57 ms sleep", strerror(errno));
+		logger_wake_fd = -1;
+		logger_wake_write_fd = -1;
+	}
+	else {
+		logger_wake_fd = pipefds[0];
+		logger_wake_write_fd = pipefds[1];
+		fcntl(logger_wake_fd, F_SETFL, O_NONBLOCK);
+		fcntl(logger_wake_write_fd, F_SETFL, O_NONBLOCK);
+		fcntl(logger_wake_fd, F_SETFD, FD_CLOEXEC);
+		fcntl(logger_wake_write_fd, F_SETFD, FD_CLOEXEC);
+	}
+	#endif
 	
 	const int result = datum_thread_create(&pthread_datum_logger_thread, datum_logger_thread, log_handle);
 	if (result != 0) {
