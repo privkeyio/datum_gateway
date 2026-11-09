@@ -338,6 +338,7 @@ void *datum_stratum_v1_socket_server(void *arg) {
 			if (stratum_latest_empty_complete_count >= app->datum_active_threads) {
 				// we are done!
 				stratum_latest_empty_ready_for_full = true;
+				datum_blocktemplates_signal_empty_done();
 				{
 					const T_DATUM_STRATUM_JOB *ej = (stratum_latest_empty_job_index < MAX_STRATUM_JOBS) ? global_cur_stratum_jobs[stratum_latest_empty_job_index] : NULL;
 					DLOG_INFO("Empty work %s send completed. Sent to %llu clients across %llu threads", datum_stratum_work_kind(ej), (unsigned long long)stratum_latest_empty_sent_count, (unsigned long long)stratum_latest_empty_complete_count);
