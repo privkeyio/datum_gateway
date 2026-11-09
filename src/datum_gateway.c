@@ -113,12 +113,12 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 			break;
 		case 0x101:  // test
 			datum_sockets_eventfd_tests();
+			datum_blocktemplates_tests();
 			datum_utils_tests();
 			datum_conf_tests();
 #ifdef ENABLE_API
 			datum_api_tests();
 #endif
-			datum_blocktemplates_tests();
 			datum_coinbaser_tests();
 			datum_parent_fetch_tests();
 			datum_pow_tests();
@@ -248,6 +248,7 @@ int main(const int argc, const char * const * const argv) {
 	}
 	
 	DLOG_DEBUG("Starting template fetcher thread");
+	datum_blocktemplates_init_wake();
 	datum_thread_create(&pthread_datum_gateway_template, datum_gateway_template_thread, NULL);
 	
 	// Note: The stratum thread will wait for a template to be available for some time before panicking.

@@ -1844,6 +1844,8 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	} else {
 		DLOG_INFO("Coinbaser: prev-block check: pool block=%s in %" PRIu64 " ms (%d of %d split outputs paid%s)", pool_block ? "yes" : "no", current_time_millis() - start, matched, n, paid_pool ? ", pool script paid" : "");
 	}
+	datum_coinbaser_arm_solo_log();
+
 	return pool_block;
 }
 
@@ -2258,6 +2260,7 @@ err:
 		DLOG_INFO("DATUM connection resumed with Prime ID %16.16"PRIx64,
 			datum_config.prime_id);
 		datum_protocol_replay_unanswered();
+		datum_blocktemplates_pool_unproven();
 	} else if (first_configuration && datum_requested_resume) {
 		DLOG_WARN("DATUM resume was declined; discarded queued shares from the old session");
 	}
@@ -2743,6 +2746,7 @@ int datum_protocol_share_response(const int len, unsigned char * const data) {
 			++datum_accepted_share_count;
 			datum_protocol_add_share_diff(&datum_accepted_share_diff, target_pot);
 			datum_last_accepted_share_tsms = datum_protocol_mainloop_tsms;
+			datum_blocktemplates_pool_proven();
 			
 			break;
 		}
@@ -3007,6 +3011,7 @@ int datum_protocol_mining_cmd5(T_DATUM_PROTOCOL_HEADER *h, unsigned char *data) 
 			// Server says we should check for a new block template immediately
 			DLOG_DEBUG("DATUM server blocknotify");
 			datum_blocktemplates_notifynew(NULL, 0, "prime");
+			datum_blocktemplates_pool_proven();
 			return 1;
 			break;
 		}

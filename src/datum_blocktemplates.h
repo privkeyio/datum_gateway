@@ -206,5 +206,11 @@ void datum_blocktemplates_notifynew(const char *prevhash, int height, const char
 void datum_blocktemplates_notify_othercause();
 void datum_blocktemplates_notify_refresh(void);
 bool datum_blocktemplates_take_refresh(void);
+void datum_blocktemplates_prime_acked(void);
+void datum_blocktemplates_pool_unproven(void);
+void datum_blocktemplates_pool_proven(void);
+bool datum_blocktemplates_pool_is_proven(void);
+void datum_blocktemplates_init_wake(void);
+void datum_blocktemplates_stop(void);
 
 #endif
