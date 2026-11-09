@@ -1844,6 +1844,8 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	} else {
 		DLOG_INFO("Coinbaser: prev-block check: pool block=%s in %" PRIu64 " ms (%d of %d split outputs paid%s)", pool_block ? "yes" : "no", current_time_millis() - start, matched, n, paid_pool ? ", pool script paid" : "");
 	}
+	datum_coinbaser_arm_solo_log();
+
 	return pool_block;
 }
 
