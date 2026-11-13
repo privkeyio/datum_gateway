@@ -60,14 +60,40 @@ volatile sig_atomic_t new_notify = 0;
 atomic_int new_notify_threadsafe = 0;
 atomic_int notify_othercause = 0;
 static pthread_mutex_t new_notify_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Held false from a non-prime new-block until a prime notification,
+ * and only when reuse is configured and the pool is up. While false,
+ * standard jobs are not published, so they cannot fetch a fresh coinbaser
+ * and close the priority job's id. A dropped pool stops the hold: jobs
+ * solo through the normal not-active path. */
+static atomic_bool pool_tip_acked = true;
+static pthread_mutex_t pool_tip_lock = PTHREAD_MUTEX_INITIALIZER;
+static void datum_blocktemplates_prime_acked(void);
+static bool prime_since_block = false;
+static bool notify_log_pending = false;
+static bool notify_released = false;
 volatile char new_notify_blockhash[256] = { 0 };
 volatile int new_notify_height = 0;
+static const char *new_notify_source = NULL;
+static bool new_notify_bare = true;
 
 void datum_blocktemplates_notifynew_sighandler() {
 	new_notify = 1;
 }
 
-void datum_blocktemplates_notifynew(const char * const prevhash, const int height) {
+void datum_blocktemplates_notifynew(const char * const prevhash, const int height, const char *source) {
+	bool released = false;
+	pthread_mutex_lock(&pool_tip_lock);
+	new_notify_source = source ? source : "unknown";
+	new_notify_bare = !(prevhash && prevhash[0]);
+	if (source && strcmp(source, "prime") == 0) {
+		released = !atomic_exchange(&pool_tip_acked, true);
+		prime_since_block = true;
+	}
+	pthread_mutex_unlock(&pool_tip_lock);
+	if (released) {
+		notify_released = true;
+		datum_blocktemplates_prime_acked();
+	}
 	if (prevhash && *prevhash) pthread_mutex_lock(&new_notify_lock);
 	new_notify_threadsafe = 1;
 	if (prevhash) {
@@ -79,6 +105,25 @@ void datum_blocktemplates_notifynew(const char * const prevhash, const int heigh
 			pthread_mutex_unlock(&new_notify_lock);
 		}
 	}
+}
+
+static void datum_blocktemplates_prime_acked(void) {
+	datum_blocktemplates_notify_refresh();
+}
+
+/* The wait loop records a notification. The new-block path, or the
+ * release in notifynew, emits one combined line once the outcome is known.
+ * action is " + HOLD", " + RELEASE", or NULL for the plain fallthrough. */
+static void datum_blocktemplates_log_notify(const char *action) {
+	const char *src = new_notify_source ? new_notify_source : "unknown";
+	if (new_notify_bare) {
+		DLOG_INFO("NEW NETWORK BLOCK NOTIFICATION%s (bare, %s)", action ? action : "", src);
+	} else {
+		DLOG_INFO("NEW NETWORK BLOCK NOTIFICATION%s (full, %s): %s (%d)",
+			action ? action : "", src, new_notify_blockhash, new_notify_height);
+	}
+	notify_log_pending = false;
+	notify_released = false;
 }
 
 void datum_blocktemplates_notify_othercause() {
@@ -428,7 +473,7 @@ void *datum_gateway_fallback_notifier(void *args) {
 						} else {
 							if (strcmp(s, p1) != 0) {
 								// new block?!?!?!
-								datum_blocktemplates_notifynew(s,0);
+								datum_blocktemplates_notifynew(s, 0, "fallback");
 								strncpy(p1,s,70);
 							}
 						}
@@ -527,12 +572,25 @@ void *datum_gateway_template_thread(void *args) {
 					const bool new_block = strcmp(t->previousblockhash, p1);
 					if (new_block || notify_othercause) {
 						notify_othercause = 0;
+						bool held = false;
+						if (new_block && datum_config.datum_coinbaser_reuse && datum_protocol_is_active()) {
+							pthread_mutex_lock(&pool_tip_lock);
+							held = new_notify_source && strcmp(new_notify_source, "prime") != 0 && !prime_since_block;
+							if (held) atomic_store(&pool_tip_acked, false);
+							if (new_block) prime_since_block = false;
+							pthread_mutex_unlock(&pool_tip_lock);
+						} else if (new_block && !datum_protocol_is_active()) {
+							pthread_mutex_lock(&pool_tip_lock);
+							prime_since_block = false;
+							pthread_mutex_unlock(&pool_tip_lock);
+						}
+						if (notify_log_pending || notify_released) datum_blocktemplates_log_notify(held ? " + HOLD" : (notify_released ? " + RELEASE" : NULL));
 						update_stratum_job(t,true,JOB_STATE_EMPTY_PLUS);
 						if (new_block) {
 							last_block_change = current_time_millis();
 							strcpy(p1, t->previousblockhash);
 							was_notified = false;
-							DLOG_INFO("NEW NETWORK BLOCK: %s (%lu)", t->previousblockhash, (unsigned long)t->height);
+							DLOG_INFO("NEW NETWORK BLOCK%s: %s (%lu)", held ? " + HOLD" : "", t->previousblockhash, (unsigned long)t->height);
 						} else {
 							DLOG_DEBUG("Urgent work update triggered");
 						}
@@ -552,10 +610,14 @@ void *datum_gateway_template_thread(void *args) {
 						// use this template to setup for a coinbaser wait job while the empty + full w/blank jobs are blasted
 						// then this job will get blasted when its ready.
 						i = datum_stratum_v1_global_subscriber_count();
-						DLOG_INFO("Updating priority stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 						update_stratum_job(t,false,JOB_STATE_FULL_PRIORITY_WAIT_COINBASER);
+						{
+							const T_DATUM_STRATUM_JOB *pj = global_cur_stratum_jobs[global_latest_stratum_job_index];
+							DLOG_INFO("Updating priority %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(pj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
+						}
 					} else {
 						if (was_notified) {
+							if (notify_log_pending) datum_blocktemplates_log_notify(NULL);
 							// we got a notification of a new block, but there doesn't seem to actually be a new block.
 							// we should quickly check again instead of actually updating the stratum job
 							
@@ -614,11 +676,19 @@ void *datum_gateway_template_thread(void *args) {
 								}
 							}
 							pthread_mutex_unlock(&new_notify_lock);
+						// Gated early bailout, prevents edge case of a very late prime having a standard job created which will make reject shares.
+						} else if (!atomic_load(&pool_tip_acked) && datum_protocol_is_active()) { DLOG_INFO("Holding standard job: waiting for prime notification of this tip");
 						} else {
 							i = datum_stratum_v1_global_subscriber_count();
-							DLOG_INFO("Updating standard stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 							const bool refresh = datum_blocktemplates_take_refresh();
 							update_stratum_job(t,false,refresh ? JOB_STATE_FULL_PRIORITY_WAIT_COINBASER : JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
+							pthread_mutex_lock(&pool_tip_lock);
+							prime_since_block = false;
+							pthread_mutex_unlock(&pool_tip_lock);
+							{
+								const T_DATUM_STRATUM_JOB *sj = global_cur_stratum_jobs[global_latest_stratum_job_index];
+								DLOG_INFO("Updating standard %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(sj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
+							}
 						}
 					}
 				}
@@ -631,6 +701,13 @@ void *datum_gateway_template_thread(void *args) {
 			for(i=0;i<(((uint64_t)datum_config.bitcoind_work_update_seconds*(uint64_t)1000000)/(uint64_t)2500);i++) {
 				usleep(2500);
 				if (atomic_load(&notify_refresh) && !(new_notify || new_notify_threadsafe)) {
+					/* A hold never takes the refresh, so a stale one would
+					 * break this loop every pass and spin getblocktemplate.
+					 * Drop it. A prime notify sets new_notify and wakes us. */
+					if (!atomic_load(&pool_tip_acked) && datum_protocol_is_active()) {
+						datum_blocktemplates_take_refresh();
+						continue;
+					}
 					break;
 				}
 				if (new_notify || new_notify_threadsafe) {
@@ -638,7 +715,8 @@ void *datum_gateway_template_thread(void *args) {
 					new_notify_threadsafe = 0;
 					was_notified = 1;
 					wnc = 0;
-					DLOG_INFO("NEW NETWORK BLOCK NOTIFICATION RECEIVED");
+					if (notify_released) datum_blocktemplates_log_notify(" + RELEASE");
+					else notify_log_pending = true;
 					break;
 				}
 			}

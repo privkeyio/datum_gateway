@@ -202,7 +202,7 @@ bool datum_blocktemplates_abw_ready(T_DATUM_TEMPLATE_DATA *block_template,
 	bool datum_active, bool abw_required);
 void *datum_gateway_template_thread(void *args);
 void datum_blocktemplates_notifynew_sighandler();
-void datum_blocktemplates_notifynew(const char *prevhash, int height);
+void datum_blocktemplates_notifynew(const char *prevhash, int height, const char *source);
 void datum_blocktemplates_notify_othercause();
 void datum_blocktemplates_notify_refresh(void);
 bool datum_blocktemplates_take_refresh(void);
