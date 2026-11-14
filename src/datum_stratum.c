@@ -338,7 +338,10 @@ void *datum_stratum_v1_socket_server(void *arg) {
 			if (stratum_latest_empty_complete_count >= app->datum_active_threads) {
 				// we are done!
 				stratum_latest_empty_ready_for_full = true;
-				DLOG_INFO("Empty work send completed. Sent to %llu clients across %llu threads", (unsigned long long)stratum_latest_empty_sent_count, (unsigned long long)stratum_latest_empty_complete_count);
+				{
+					const T_DATUM_STRATUM_JOB *ej = (stratum_latest_empty_job_index < MAX_STRATUM_JOBS) ? global_cur_stratum_jobs[stratum_latest_empty_job_index] : NULL;
+					DLOG_INFO("Empty work %s send completed. Sent to %llu clients across %llu threads", datum_stratum_work_kind(ej), (unsigned long long)stratum_latest_empty_sent_count, (unsigned long long)stratum_latest_empty_complete_count);
+				}
 				/* The threadpool threads check this flag inside their job loop.
 				 * Without a wake they sit in epoll_wait until the 1000ms timeout. */
 				for (int tid = 0; tid < app->max_threads; ++tid) {
@@ -516,9 +519,15 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 		change_ready = !datum_stratum_holds_job(sdata, global_cur_stratum_jobs[global_latest_stratum_job_index]);
 		
 		if (change_ready) {
+			const T_DATUM_STRATUM_JOB *prev = sdata->cur_stratum_job;
+			/* Stretch, solo-while-connected, and fallback are not the pool's
+			 * current split. The job that replaces them must go out immediately. */
+			const bool prev_needs_immediate = prev &&
+				(prev->provisional_split || prev->solo_while_connected || prev->fallback_next_script);
 			sdata->cur_stratum_job = global_cur_stratum_jobs[global_latest_stratum_job_index];
 			sdata->latest_stratum_job_index = global_latest_stratum_job_index;
 			sdata->new_job = true;
+			sdata->replacing_provisional = prev_needs_immediate;
 			
 			if (sdata->cur_stratum_job->job_state == 2) {
 				// make sure we dont skip our empty work if job type 2
@@ -646,23 +655,22 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 			case 5: {
 				sdata->full_coinbase_ready = false;
 				if (stratum_job_coinbaser_ready(sdata,job)) {
-					// this is a normal job that normally gets slowly sent out over the course of the work change time until interupted by a new block
-					if (sdata->last_was_empty) {
-						// HOWEVER...
-						// if the last work this thread sent out was empty work, likely due to load or whatever
-						// then we don't want to delay the sending of full work.
-						// up until this point, this wasn't a concern, but it could be if load is high and the socket side processing
-						// takes a long time
-						// blast out the work NOW
-						DLOG_DEBUG("Blasting full work for type 5 job thread %d",my->thread_id);
+					// Blast when replacing empty, stretch, solo, or fallback work.
+					// Those are not the pool's current split; miners must leave them now.
+					// Ordinary same-tip refreshes (miners already on a valid pool job)
+					// keep the existing paced path.
+					if (sdata->last_was_empty || sdata->replacing_provisional) {
+						DLOG_DEBUG("Blasting full work for type 5 job thread %d (replacing non-pool work)", my->thread_id);
 						for(i=0;i<my->app->max_clients_thread;i++) {
 							m = my->client_data[i].app_client_data;
 							if (my->client_data[i].fd && m->subscribed) {
-								send_mining_notify(&my->client_data[i], datum_stratum_notify_replaces_job(job->job_state, sdata->last_was_empty), false, false);
+								send_mining_notify(&my->client_data[i],
+									datum_stratum_notify_replaces_job(job->job_state, true),
+									false, false);
 							}
 						}
 					} else {
-						// last work was not empty, so we can safely slow things up a bit.
+						// last work was a valid pool job, so we can safely slow things up a bit.
 						sdata->notify_remaining_count = datum_stratum_v1_get_thread_subscriber_count(my);
 						
 						if (sdata->notify_remaining_count > 0) {
@@ -680,6 +688,7 @@ void datum_stratum_v1_socket_thread_loop(T_DATUM_THREAD_DATA *my) {
 					}
 					sdata->new_job = false;
 					sdata->last_was_empty = false;
+					sdata->replacing_provisional = false;
 					sdata->last_sent_job_state = 5; // technically might not be "sent" yet, but last processed for sure.
 				}
 				break;
@@ -1345,7 +1354,7 @@ int client_mining_submit(T_DATUM_CLIENT_DATA *c, uint64_t id, json_t *params_obj
 			full_cb_txn_size, job, m->sdata, new_notify_blockhash,
 			empty_work, extranonce_bin);
 		if (i) {
-			datum_blocktemplates_notifynew(new_notify_blockhash, job->height + 1);
+			datum_blocktemplates_notifynew(new_notify_blockhash, job->height + 1, "stratum");
 		}
 	}
 	
@@ -1542,6 +1551,15 @@ unsigned int datum_stratum_coinbase_index(
 	    !sdata->full_coinbase_ready ||
 	    miner->coinbase_selection >= MAX_COINBASE_TYPES) return 0;
 	return miner->coinbase_selection;
+}
+
+const char *datum_stratum_work_kind(const T_DATUM_STRATUM_JOB *s) {
+	if (!s) return "local";
+	if (s->fallback_next_script) return "fallback";
+	if (s->solo_while_connected) return "solo";
+	if (s->provisional_split) return "stretch";
+	if (s->is_datum_job) return "pool";
+	return "local";
 }
 
 bool datum_stratum_notify_replaces_job(int job_state, bool opening_job_still_current) {

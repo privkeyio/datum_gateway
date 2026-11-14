@@ -34,9 +34,18 @@
  */
 
 #include <jansson.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
+#include <poll.h>
 
 #include "datum_blocktemplates.h"
 #include "datum_utils.h"
+#include "datum_conf.h"
+#include <stdatomic.h>
+
+extern int templates_wake_write_fd;
+extern int templates_wake_fd;
 
 static void datum_gbt_rules_blake2b_tests(void) {
 	json_error_t error;
@@ -89,7 +98,27 @@ static void datum_blocktemplates_abw_mode_tests(void) {
 		&block_template, true, true));
 }
 
+static uint64_t now_us(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000ull + ts.tv_nsec / 1000ull;
+}
+
+static void datum_blocktemplates_eventfd_test(void) {
+	datum_blocktemplates_init_wake();
+	uint64_t one = 1;
+	uint64_t start = now_us();
+	datum_test(write(templates_wake_write_fd, &one, sizeof(one)) == (ssize_t)sizeof(one));
+	struct pollfd pfd = { .fd = templates_wake_write_fd, .events = POLLIN };
+	datum_test(poll(&pfd, 1, 1000) > 0);
+	uint64_t n;
+	datum_test(read(templates_wake_write_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+	printf("Blocktemplate eventfd wake: %llu us\n", (unsigned long long)(now_us() - start));
+	datum_test(now_us() - start < 50000);
+}
+
 void datum_blocktemplates_tests(void) {
 	datum_gbt_rules_blake2b_tests();
 	datum_blocktemplates_abw_mode_tests();
+	datum_blocktemplates_eventfd_test();
 }

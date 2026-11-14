@@ -46,6 +46,11 @@
 #include <curl/curl.h>
 #include <stdatomic.h>
 #include <signal.h>
+#include <poll.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 #include "datum_gateway.h"
 #include "datum_jsonrpc.h"
@@ -60,14 +65,85 @@ volatile sig_atomic_t new_notify = 0;
 atomic_int new_notify_threadsafe = 0;
 atomic_int notify_othercause = 0;
 static pthread_mutex_t new_notify_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Held false from a non-prime new-block until a prime notification,
+ * and only when reuse is configured and the pool is up. While false,
+ * standard jobs are not published, so they cannot fetch a fresh coinbaser
+ * and close the priority job's id. A dropped pool stops the hold: jobs
+ * solo through the normal not-active path. */
+static atomic_bool pool_tip_acked = true;
+static pthread_mutex_t pool_tip_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool prime_since_block = false;
+static bool notify_log_pending = false;
+static bool notify_released = false;
+static atomic_bool pool_proven = true;
 volatile char new_notify_blockhash[256] = { 0 };
 volatile int new_notify_height = 0;
+static const char *new_notify_source = NULL;
+static bool new_notify_bare = true;
+static atomic_int templates_stop = 0;
+static atomic_int notify_refresh = 0;
+
+int templates_wake_fd = -1;
+int templates_wake_write_fd = -1;
+
+void datum_blocktemplates_init_wake(void) {
+#ifdef __linux__
+	templates_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (templates_wake_fd < 0) {
+		DLOG_ERROR("eventfd for block templates failed: %s; falling back to timed sleep", strerror(errno));
+	} else {
+		templates_wake_write_fd = templates_wake_fd;
+	}
+#else
+	int pipefds[2];
+	if (pipe(pipefds) != 0) {
+		DLOG_ERROR("pipe for block templates failed: %s; falling back to timed sleep", strerror(errno));
+		templates_wake_fd = -1;
+		templates_wake_write_fd = -1;
+	} else {
+		templates_wake_fd = pipefds[0];
+		templates_wake_write_fd = pipefds[1];
+		fcntl(templates_wake_fd, F_SETFL, O_NONBLOCK);
+		fcntl(templates_wake_write_fd, F_SETFL, O_NONBLOCK);
+		fcntl(templates_wake_fd, F_SETFD, FD_CLOEXEC);
+		fcntl(templates_wake_write_fd, F_SETFD, FD_CLOEXEC);
+	}
+#endif
+}
+
+void datum_blocktemplates_wake(void) {
+	if (templates_wake_write_fd >= 0) {
+		int saved = errno;
+		uint64_t one = 1;
+		(void)write(templates_wake_write_fd, &one, sizeof(one));
+		errno = saved;
+	}
+}
+
+void datum_blocktemplates_stop(void) {
+	atomic_store(&templates_stop, 1);
+	datum_blocktemplates_wake();
+}
 
 void datum_blocktemplates_notifynew_sighandler() {
 	new_notify = 1;
+	datum_blocktemplates_wake();
 }
 
-void datum_blocktemplates_notifynew(const char * const prevhash, const int height) {
+void datum_blocktemplates_notifynew(const char * const prevhash, const int height, const char *source) {
+	bool released = false;
+	pthread_mutex_lock(&pool_tip_lock);
+	new_notify_source = source ? source : "unknown";
+	new_notify_bare = !(prevhash && prevhash[0]);
+	if (source && strcmp(source, "prime") == 0) {
+		released = !atomic_exchange(&pool_tip_acked, true);
+		prime_since_block = true;
+	}
+	pthread_mutex_unlock(&pool_tip_lock);
+	if (released) {
+		notify_released = true;
+		datum_blocktemplates_prime_acked();
+	}
 	if (prevhash && *prevhash) pthread_mutex_lock(&new_notify_lock);
 	new_notify_threadsafe = 1;
 	if (prevhash) {
@@ -79,18 +155,52 @@ void datum_blocktemplates_notifynew(const char * const prevhash, const int heigh
 			pthread_mutex_unlock(&new_notify_lock);
 		}
 	}
+	datum_blocktemplates_wake();
+}
+
+void datum_blocktemplates_prime_acked(void) {
+	atomic_store(&pool_tip_acked, true);
+	datum_blocktemplates_notify_refresh();
+}
+
+/* The wait loop records a notification. The new-block path, or the
+ * release in notifynew, emits one combined line once the outcome is known.
+ * action is " + HOLD", " + RELEASE", or NULL for the plain fallthrough. */
+static void datum_blocktemplates_log_notify(const char *action) {
+	const char *src = new_notify_source ? new_notify_source : "unknown";
+	if (new_notify_height && src && strcmp(src, "fallback") == 0) new_notify_height = 0;
+	if (new_notify_bare) {
+		DLOG_INFO("NEW NETWORK BLOCK NOTIFICATION%s (bare, %s)", action ? action : "", src);
+	} else {
+		DLOG_INFO("NEW NETWORK BLOCK NOTIFICATION%s (full, %s): %s (%d)",
+			action ? action : "", src, new_notify_blockhash, new_notify_height);
+	}
+	notify_log_pending = false;
+	notify_released = false;
 }
 
 void datum_blocktemplates_notify_othercause() {
 	notify_othercause = 1;
+	datum_blocktemplates_wake();
+}
+
+void datum_blocktemplates_pool_unproven(void) {
+	atomic_store(&pool_proven, false);
+}
+void datum_blocktemplates_pool_proven(void) {
+	if (!atomic_exchange(&pool_proven, true))
+		datum_blocktemplates_notify_refresh();
+}
+bool datum_blocktemplates_pool_is_proven(void) {
+	return atomic_load(&pool_proven);
 }
 
 /* Ask for a standard job on the current tip now, served at once rather than
  * paced: used when the pool's split arrives after miners were given a
  * provisional one, or after the first split ends solo-until-first-split. */
-static atomic_int notify_refresh = 0;
 void datum_blocktemplates_notify_refresh(void) {
 	atomic_store(&notify_refresh, 1);
+	datum_blocktemplates_wake();
 }
 
 bool datum_blocktemplates_take_refresh(void) {
@@ -428,7 +538,7 @@ void *datum_gateway_fallback_notifier(void *args) {
 						} else {
 							if (strcmp(s, p1) != 0) {
 								// new block?!?!?!
-								datum_blocktemplates_notifynew(s,0);
+								datum_blocktemplates_notifynew(s, 0, "fallback");
 								strncpy(p1,s,70);
 							}
 						}
@@ -450,9 +560,10 @@ void *datum_gateway_template_thread(void *args) {
 	int j;
 	T_DATUM_TEMPLATE_DATA *t;
 	bool was_notified = false;
-	int wnc = 0;
 	uint64_t last_block_change = 0;
 	pthread_t pthread_datum_gateway_fallback_notifier;
+	uint64_t notify_us = 0;
+	
 	tcurl = curl_easy_init();
 	if (!tcurl) {
 		DLOG_FATAL("Could not initialize cURL");
@@ -491,7 +602,13 @@ void *datum_gateway_template_thread(void *args) {
 	p1[0] = 0;
 	
 	while(1) {
+		if (atomic_load(&templates_stop)) return NULL;
 		i++;
+		
+		if (templates_wake_fd >= 0) {
+			uint64_t n;
+			while (read(templates_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+		}
 		
 		// fetch latest template
 		snprintf(gbt_req, sizeof(gbt_req), "{\"method\":\"getblocktemplate\",\"params\":[{\"rules\":[\"segwit\",\"blake2b\"]}],\"id\":%"PRIu64"}",(uint64_t)((uint64_t)time(NULL)<<(uint64_t)8)|(uint64_t)(i&255));
@@ -527,12 +644,25 @@ void *datum_gateway_template_thread(void *args) {
 					const bool new_block = strcmp(t->previousblockhash, p1);
 					if (new_block || notify_othercause) {
 						notify_othercause = 0;
+						bool held = false;
+						if (new_block && datum_config.datum_coinbaser_reuse && datum_protocol_is_active()) {
+							pthread_mutex_lock(&pool_tip_lock);
+							held = new_notify_source && strcmp(new_notify_source, "prime") != 0 && !prime_since_block;
+							if (held) atomic_store(&pool_tip_acked, false);
+							if (new_block) prime_since_block = false;
+							pthread_mutex_unlock(&pool_tip_lock);
+						} else if (new_block && !datum_protocol_is_active()) {
+							pthread_mutex_lock(&pool_tip_lock);
+							prime_since_block = false;
+							pthread_mutex_unlock(&pool_tip_lock);
+						}
+						if (notify_log_pending || notify_released) datum_blocktemplates_log_notify(held ? " + HOLD" : (notify_released ? " + RELEASE" : NULL));
 						update_stratum_job(t,true,JOB_STATE_EMPTY_PLUS);
 						if (new_block) {
 							last_block_change = current_time_millis();
 							strcpy(p1, t->previousblockhash);
 							was_notified = false;
-							DLOG_INFO("NEW NETWORK BLOCK: %s (%lu)", t->previousblockhash, (unsigned long)t->height);
+							DLOG_INFO("NEW NETWORK BLOCK%s: %s (%lu)", held ? " + HOLD" : "", t->previousblockhash, (unsigned long)t->height);
 						} else {
 							DLOG_DEBUG("Urgent work update triggered");
 						}
@@ -552,10 +682,14 @@ void *datum_gateway_template_thread(void *args) {
 						// use this template to setup for a coinbaser wait job while the empty + full w/blank jobs are blasted
 						// then this job will get blasted when its ready.
 						i = datum_stratum_v1_global_subscriber_count();
-						DLOG_INFO("Updating priority stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 						update_stratum_job(t,false,JOB_STATE_FULL_PRIORITY_WAIT_COINBASER);
+						{
+							const T_DATUM_STRATUM_JOB *pj = global_cur_stratum_jobs[global_latest_stratum_job_index];
+							DLOG_INFO("Updating priority %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(pj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
+						}
 					} else {
 						if (was_notified) {
+							if (notify_log_pending) datum_blocktemplates_log_notify(NULL);
 							// we got a notification of a new block, but there doesn't seem to actually be a new block.
 							// we should quickly check again instead of actually updating the stratum job
 							
@@ -564,11 +698,11 @@ void *datum_gateway_template_thread(void *args) {
 								// we got notified for work we already knew about
 								if (new_notify_height <= 0) {
 									was_notified = false;
-									wnc = 0;
+									notify_us = 0;
 								} else {
 									if (new_notify_height == t->height) {
 										was_notified = false;
-										wnc = 0;
+										notify_us = 0;
 									}
 								}
 							}
@@ -614,11 +748,21 @@ void *datum_gateway_template_thread(void *args) {
 								}
 							}
 							pthread_mutex_unlock(&new_notify_lock);
+						// Gated early bailout, prevents edge case of a very late prime having a standard job created which will make reject shares.
+						} else if (!atomic_load(&pool_tip_acked) && datum_protocol_is_active()) { DLOG_INFO("Holding standard job: waiting for prime notification of this tip");
 						} else {
 							i = datum_stratum_v1_global_subscriber_count();
-							DLOG_INFO("Updating standard stratum job for block %lu: %.8f BTC, %lu txns, %lu bytes (Sent to %llu stratum client%s)", (unsigned long)t->height, (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"");
 							const bool refresh = datum_blocktemplates_take_refresh();
-							update_stratum_job(t,false,refresh ? JOB_STATE_FULL_PRIORITY_WAIT_COINBASER : JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
+							const bool split_held = refresh && datum_protocol_coinbaser_have_saved();
+							const bool proven = datum_blocktemplates_pool_is_proven();
+							update_stratum_job(t,false,(split_held && proven) ? JOB_STATE_FULL_PRIORITY_WAIT_COINBASER : JOB_STATE_FULL_PRIORITY);
+							pthread_mutex_lock(&pool_tip_lock);
+							prime_since_block = false;
+							pthread_mutex_unlock(&pool_tip_lock);
+							{
+								const T_DATUM_STRATUM_JOB *sj = global_cur_stratum_jobs[global_latest_stratum_job_index];
+								DLOG_INFO("Updating standard %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(sj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
+							}
 						}
 					}
 				}
@@ -628,28 +772,53 @@ void *datum_gateway_template_thread(void *args) {
 		gbt = NULL;
 		
 		if ((!was_notified) || (new_notify || new_notify_threadsafe)) {
-			for(i=0;i<(((uint64_t)datum_config.bitcoind_work_update_seconds*(uint64_t)1000000)/(uint64_t)2500);i++) {
-				usleep(2500);
-				if (atomic_load(&notify_refresh) && !(new_notify || new_notify_threadsafe)) {
-					break;
-				}
-				if (new_notify || new_notify_threadsafe) {
-					new_notify = 0;
-					new_notify_threadsafe = 0;
-					was_notified = 1;
-					wnc = 0;
-					DLOG_INFO("NEW NETWORK BLOCK NOTIFICATION RECEIVED");
-					break;
+			if (!(new_notify || new_notify_threadsafe || atomic_load(&notify_refresh))) {
+				int timeout_ms = datum_config.bitcoind_work_update_seconds * 1000;
+				if (templates_wake_fd >= 0) {
+					struct pollfd pfd = { .fd = templates_wake_fd, .events = POLLIN };
+					int pr = poll(&pfd, 1, timeout_ms);
+					if (pr > 0 && (pfd.revents & POLLIN)) {
+						uint64_t n;
+						while (read(templates_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+					}
+				} else {
+					for (int k = 0; k < (((uint64_t)datum_config.bitcoind_work_update_seconds * 1000000ull) / 2500ull); k++) {
+						usleep(2500);
+						if (atomic_load(&notify_refresh) || new_notify || new_notify_threadsafe) break;
+					}
 				}
 			}
+			if (atomic_load(&notify_refresh) && !(new_notify || new_notify_threadsafe)) {
+				if (!t || (!atomic_load(&pool_tip_acked) && datum_protocol_is_active())) {
+					datum_blocktemplates_take_refresh();
+				}
+			} else if (new_notify || new_notify_threadsafe) {
+				new_notify = 0;
+				new_notify_threadsafe = 0;
+				was_notified = 1;
+				notify_us = current_time_micros();
+				if (notify_released) datum_blocktemplates_log_notify(" + RELEASE");
+				else notify_log_pending = true;
+			}
 		} else {
-			usleep(250000);
-			wnc++;
-			if (wnc > 16) { // 4 seconds
-				// something is weird.
-				DLOG_WARN("We received a new block notification, however after 16 attempts we did not see a new block.");
+			uint64_t now = current_time_micros();
+			uint64_t elapsed = (notify_us && now > notify_us) ? (now - notify_us) : 0;
+			int remain_ms = (elapsed >= 4000000ull) ? 0 : (int)((4000000ull - elapsed) / 1000ull);
+			if (remain_ms <= 0) {
+				DLOG_WARN("We received a new block notification, however after 4 seconds we did not see a new block.");
 				was_notified = false;
-				wnc = 0;
+				notify_us = 0;
+			} else {
+				int step = remain_ms > 250 ? 250 : remain_ms;
+				if (templates_wake_fd >= 0) {
+					struct pollfd pfd = { .fd = templates_wake_fd, .events = POLLIN };
+					int pr = poll(&pfd, 1, step);
+					if (pr > 0 && (pfd.revents & POLLIN)) {
+						uint64_t n;
+						while (read(templates_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+					}
+				}
+				else usleep(step * 1000);
 			}
 		}
 	}
