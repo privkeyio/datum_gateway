@@ -230,6 +230,7 @@ int main(const int argc, const char * const * const argv) {
 		exit(1);
 	}
 	
+	datum_protocol_init_wake();
 	// Connect concurrently so local work remains available while the pool becomes ready.
 	if (datum_config.datum_pool_host[0] != 0) {
 		datum_protocol_start_connector();
