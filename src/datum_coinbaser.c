@@ -46,6 +46,11 @@
 #include <curl/curl.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <poll.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 #include "datum_conf.h"
 #include "datum_pow.h"
@@ -56,10 +61,36 @@
 #include "datum_coinbaser.h"
 #include "datum_blocktemplates.h"
 
+
+
 CURL *coinbaser_curl = NULL;
 
 const char *cbstart_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff"; // 82 len hex, 41 bytes
 static bool solo_log_armed = true;
+static int coinbaser_wake_fd = -1;
+static int coinbaser_wake_write_fd = -1;
+
+void datum_coinbaser_init_wake(void) {
+#ifdef __linux__
+    coinbaser_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (coinbaser_wake_fd >= 0) coinbaser_wake_write_fd = coinbaser_wake_fd;
+#else
+    int pipefds[2];
+    if (pipe(pipefds) == 0) {
+        coinbaser_wake_fd = pipefds[0];
+        coinbaser_wake_write_fd = pipefds[1];
+        fcntl(coinbaser_wake_fd, F_SETFL, O_NONBLOCK);
+        fcntl(coinbaser_wake_write_fd, F_SETFL, O_NONBLOCK);
+    }
+#endif
+}
+
+void datum_coinbaser_wake(void) {
+    if (coinbaser_wake_write_fd >= 0) {
+        uint64_t one = 1;
+        (void)write(coinbaser_wake_write_fd, &one, sizeof(one));
+    }
+}
 
 void datum_coinbaser_arm_solo_log(void) {
 	solo_log_armed = true;
@@ -921,6 +952,7 @@ void *datum_coinbaser_thread(void *ptr) {
 	T_DATUM_STRATUM_JOB *s = NULL;
 	bool need_coinbaser = false;
 	int i;
+	int timeout_ms = datum_config.bitcoind_work_update_seconds * 2 * 1000;
 	
 	DLOG_DEBUG("Coinbaser thread active");
 	
@@ -990,9 +1022,18 @@ void *datum_coinbaser_thread(void *ptr) {
 					if (datum_blocktemplates_coinbaser_late_answer(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on late answer");
 				}
 				else datum_blocktemplates_notify_refresh();
+				datum_coinbaser_wake();
 			}
 		}
-		usleep(12000);
+		
+		if (coinbaser_wake_fd >= 0) {
+			struct pollfd pfd = { .fd = coinbaser_wake_fd, .events = POLLIN };
+			if (poll(&pfd, 1, timeout_ms) == 0) DLOG_ERROR("Coinbaser wait timed out after %d s; no job update wake", datum_config.bitcoind_work_update_seconds * 2);
+			uint64_t n;
+			while (read(coinbaser_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+		} else {
+			usleep(12000);
+		}
 	}
 }
 

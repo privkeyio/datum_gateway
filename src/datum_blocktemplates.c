@@ -732,7 +732,7 @@ void *datum_gateway_template_thread(void *args) {
 						DLOG_DEBUG("Waiting on empty work send completion...");
 						if (empty_done_fd >= 0) {
 							struct pollfd pfd = { .fd = empty_done_fd, .events = POLLIN };
-							poll(&pfd, 1, 4000);
+							if (poll(&pfd, 1, 30000) == 0) DLOG_ERROR("Empty-done wait timed out after 30 s; empty sends did not complete");
 							uint64_t n;
 							while (read(empty_done_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
 						} else {

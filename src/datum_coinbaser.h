@@ -51,5 +51,7 @@ void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_o
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block);
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen);
 void datum_coinbaser_arm_solo_log(void);
+void datum_coinbaser_init_wake(void);
+void datum_coinbaser_wake(void);
 
 #endif

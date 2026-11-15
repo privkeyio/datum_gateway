@@ -2260,6 +2260,7 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 			if (global_stratum_app->datum_threads[i].is_active)
 				datum_socket_wake_thread(&global_stratum_app->datum_threads[i]);
 		}
+		if (s->need_coinbaser) datum_coinbaser_wake();
 	}
 
 	DLOG_DEBUG("Updated to job %d, ncb = %d, state = %d", s->global_index, s->need_coinbaser?1:0, s->job_state);
