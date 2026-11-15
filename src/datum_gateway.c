@@ -250,6 +250,7 @@ int main(const int argc, const char * const * const argv) {
 	DLOG_DEBUG("Starting template fetcher thread");
 	datum_blocktemplates_init_wake();
 	datum_blocktemplates_init_empty_wake();
+	datum_coinbaser_init_wake();
 	datum_thread_create(&pthread_datum_gateway_template, datum_gateway_template_thread, NULL);
 	
 	// Note: The stratum thread will wait for a template to be available for some time before panicking.

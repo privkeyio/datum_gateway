@@ -1367,6 +1367,7 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx] = x;
 	
 	pthread_cond_signal(&datum_protocol_coinbaser_fetch_cond); // Signal the condition variable
+	datum_coinbaser_wake();
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 	
 	return 1;
