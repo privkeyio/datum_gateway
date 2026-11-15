@@ -67,6 +67,11 @@
 #include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 #include "datum_utils.h"
 #include "datum_protocol.h"
@@ -111,6 +116,8 @@ pthread_mutex_t datum_protocol_sender_stage1_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t datum_protocol_send_buffer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t datum_protocol_migration_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t datum_protocol_current_migration_deadline_ms;
+static int protocol_wake_fd = -1;
+static int protocol_wake_write_fd = -1;
 
 #define DATUM_BULK_QUEUE_CAPACITY 2
 typedef struct {
@@ -182,6 +189,28 @@ extern DATUM_QUEUE pow_queue;
 
 // may be used by this thread when crafting replies to server commands
 unsigned char temp_data[DATUM_PROTOCOL_TEMP_DATA_SIZE];
+
+void datum_protocol_init_wake(void) {
+#ifdef __linux__
+	protocol_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (protocol_wake_fd >= 0) protocol_wake_write_fd = protocol_wake_fd;
+#else
+	int pipefds[2];
+	if (pipe(pipefds) == 0) {
+		protocol_wake_fd = pipefds[0];
+		protocol_wake_write_fd = pipefds[1];
+		fcntl(protocol_wake_fd, F_SETFL, O_NONBLOCK);
+		fcntl(protocol_wake_write_fd, F_SETFL, O_NONBLOCK);
+	}
+#endif
+}
+
+void datum_protocol_wake(void) {
+	if (protocol_wake_write_fd >= 0) {
+		uint64_t one = 1;
+		(void)write(protocol_wake_write_fd, &one, sizeof(one));
+	}
+}
 
 void datum_protocol_reset_server_knowledge(void) {
 	pthread_rwlock_wrlock(&datum_jobs_rwlock);
@@ -421,6 +450,7 @@ static int datum_protocol_encrypted_cmd(uint8_t proto_cmd, const void *data,
 	pthread_mutex_unlock(&datum_protocol_send_buffer_lock);
 	pthread_mutex_unlock(&datum_protocol_sender_stage1_lock);
 	
+	datum_protocol_wake();
 	return 0;
 }
 
@@ -2060,6 +2090,7 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 	datum_protocol_coinbaser_note_request(value, s->prevhash_bin, session_generation);
+	datum_protocol_wake();
 	if (reuse_on) {
 		/* Read the previous block while the pool answers. The loop below looks
 		 * for an answer before waiting, so none is lost while unlocked. */
@@ -3450,9 +3481,11 @@ int datum_protocol_pow_submit(
 	//DLOG_DEBUG("ADD: DATUM POW: time %d nonce %8.8X", pow.ntime, pow.nonce);
 	
 	const int queued = datum_queue_add_item(&pow_queue, &pow);
+	if (queued == 0) datum_protocol_wake();
 	if (queued != 0 && pow.abw_assignment_id) {
 		datum_protocol_abw_forget_exact(pow.abw_assignment_id, pow.raw_pow_hash);
 	}
+	
 	return queued;
 }
 
@@ -3842,6 +3875,11 @@ void *datum_protocol_client(void *args) {
 		return NULL;
 	}
 	
+	if (protocol_wake_fd >= 0) {
+		struct epoll_event ev = { .events = EPOLLIN, .data.fd = protocol_wake_fd };
+		epoll_ctl(epollfd, EPOLL_CTL_ADD, protocol_wake_fd, &ev);
+	}
+	
 	ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
 	ev.data.fd = sockfd;
 	
@@ -3931,7 +3969,13 @@ void *datum_protocol_client(void *args) {
 		
 		if (break_again) break;
 		
-		nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, 5);  // Wait for 5ms
+		int timeout = (datum_state == 3 || !datum_config.datum_pool_host[0]) ? 1000 : 5;
+		//nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, timeout);
+		/* A packet or wake that arrived while we were doing the
+		 * pre-wait work must not be slept past. Probe first. */
+		nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, 0);
+		if (nfds == 0)
+			nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, timeout);
 		
 		if (nfds == -1 && errno != EINTR) {
 			DLOG_FATAL("epoll_wait(...) error: %s",strerror(errno));
@@ -3942,11 +3986,26 @@ void *datum_protocol_client(void *args) {
 			continue;  // Timeout, nothing happened
 		}
 		
-		if (events[0].events & (EPOLLERR | EPOLLHUP)) {
+		bool socket_ready = false;
+		bool socket_error = false;
+		for (int i = 0; i < nfds; i++) {
+			if (events[i].data.fd == protocol_wake_fd) {
+				uint64_t n;
+				while (read(protocol_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+				datum_protocol_flush_socket(sockfd);
+			} else if (events[i].data.fd == sockfd) {
+				if (events[i].events & (EPOLLERR | EPOLLHUP))
+					socket_error = true;
+				if (events[i].events & EPOLLIN)
+					socket_ready = true;
+			}
+		}
+		
+		if (socket_error) {
 			int err = 0;
 			socklen_t errlen = sizeof(err);
 			
-			if (getsockopt(events[0].data.fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0) {
+			if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0) {
 				if (err != 0) {
 					DLOG_ERROR("Socket error: %s", strerror(err));
 				} else {
@@ -3958,7 +4017,7 @@ void *datum_protocol_client(void *args) {
 			break;
 		}
 		
-		if (events[0].events & EPOLLIN) {
+		if (socket_ready) {
 			// data to receive
 			break_again = false;
 			// Receive the header, followed by any data specified by the header

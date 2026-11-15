@@ -196,6 +196,7 @@ unsigned char datum_protocol_setup_new_job_idx(void *sx);
 int datum_protocol_pow_build_message(T_DATUM_PROTOCOL_POW *pow, unsigned char *msg, size_t msg_size);
 bool datum_protocol_abw_apply_active(T_DATUM_TEMPLATE_DATA *block_template);
 bool datum_protocol_abw_health_ok(void);
+void datum_protocol_init_wake(void);
 
 extern uint64_t datum_accepted_share_count;
 extern uint64_t datum_accepted_share_diff;
