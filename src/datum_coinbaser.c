@@ -955,6 +955,14 @@ void *datum_coinbaser_thread(void *ptr) {
 					}
 				}
 				DLOG_DEBUG("Generated and notified.");
+				/* Pool answered for this exact tip and value. A provisional
+				 * reuse does not set exact_ready, so it cannot release.
+				 * The tip check inside release_hold rejects a parse for a
+				 * tip that is no longer the held one. */
+				if (i >= 2 && datum_protocol_is_active() &&
+				    datum_protocol_coinbaser_exact_ready(s)) {
+					if (datum_blocktemplates_release_hold(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on exact parse");
+				}
 				if (datum_protocol_coinbaser_reuse_active() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
 					// solo until first split: the first split is saved, so move miners onto pooled work
 					DLOG_INFO("Coinbaser: first split received; replacing solo work with pooled work");
@@ -967,12 +975,12 @@ void *datum_coinbaser_thread(void *ptr) {
 			unsigned char late_tip[32];
 			if (datum_protocol_coinbaser_reuse_active() &&
 			    datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
-				/* Reuse off does not refresh. A pool slower than 5s would
-				 * otherwise blast new work on every timeout. */
-				datum_blocktemplates_notify_refresh();
+				if (datum_protocol_coinbaser_exact_ready(s)) {
+					if (datum_blocktemplates_coinbaser_late_answer(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on late answer");
+				}
+				else datum_blocktemplates_notify_refresh();
 			}
 		}
-		
 		usleep(12000);
 	}
 }
