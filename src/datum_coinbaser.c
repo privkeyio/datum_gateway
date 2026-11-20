@@ -59,6 +59,11 @@
 CURL *coinbaser_curl = NULL;
 
 const char *cbstart_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff"; // 82 len hex, 41 bytes
+static bool solo_log_armed = true;
+
+void datum_coinbaser_arm_solo_log(void) {
+	solo_log_armed = true;
+}
 
 int generate_coinbase_data(int height, uint8_t *cb, int *target_pot_index, bool datum_active) {
 	int coinbase_data_size = 0;
@@ -428,14 +433,20 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		!datum_protocol_abw_scaled_reuse_ok() &&
 		!datum_protocol_coinbaser_exact_ready(s);
 	const bool solo_until_first_split = no_split || prev_solo || abw_solo;
-	if (no_split) {
-		DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
-	} else if (prev_solo == 1) {
-		DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
-	} else if (prev_solo) {
-		DLOG_INFO("Coinbaser: previous block not verified; this job pays mining.pool_address until it is or the pool answers");
-	} else if (abw_solo) {
-		DLOG_INFO("Coinbaser: ABW template; paying mining.pool_address until the pool's own split");
+	if (solo_log_armed) {
+		if (no_split) {
+			DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
+			solo_log_armed = false;
+		} else if (prev_solo == 1) {
+			DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
+			solo_log_armed = false;
+		} else if (prev_solo) {
+			DLOG_INFO("Coinbaser: previous block not verified; this job pays mining.pool_address until it is or the pool answers");
+			solo_log_armed = false;
+		} else if (abw_solo) {
+			DLOG_INFO("Coinbaser: ABW template; paying mining.pool_address until the pool's own split");
+			solo_log_armed = false;
+		}
 	}
 	s->solo_while_connected = false;
 	if (datum_protocol_is_active() && !solo_until_first_split) {
@@ -955,6 +966,14 @@ void *datum_coinbaser_thread(void *ptr) {
 					}
 				}
 				DLOG_DEBUG("Generated and notified.");
+				/* Pool answered for this exact tip and value. A provisional
+				 * reuse does not set exact_ready, so it cannot release.
+				 * The tip check inside release_hold rejects a parse for a
+				 * tip that is no longer the held one. */
+				if (i >= 2 && datum_protocol_is_active() &&
+				    datum_protocol_coinbaser_exact_ready(s)) {
+					if (datum_blocktemplates_release_hold(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on exact parse");
+				}
 				if (datum_protocol_coinbaser_reuse_active() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
 					// solo until first split: the first split is saved, so move miners onto pooled work
 					DLOG_INFO("Coinbaser: first split received; replacing solo work with pooled work");
@@ -967,12 +986,12 @@ void *datum_coinbaser_thread(void *ptr) {
 			unsigned char late_tip[32];
 			if (datum_protocol_coinbaser_reuse_active() &&
 			    datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
-				/* Reuse off does not refresh. A pool slower than 5s would
-				 * otherwise blast new work on every timeout. */
-				datum_blocktemplates_notify_refresh();
+				if (datum_protocol_coinbaser_exact_ready(s)) {
+					if (datum_blocktemplates_coinbaser_late_answer(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on late answer");
+				}
+				else datum_blocktemplates_notify_refresh();
 			}
 		}
-		
 		usleep(12000);
 	}
 }

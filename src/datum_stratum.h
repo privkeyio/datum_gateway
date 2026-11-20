@@ -182,6 +182,8 @@ typedef struct T_DATUM_STRATUM_JOB {
 	bool solo_while_connected;
 	
 	bool provisional_split; // coinbases built at creation from the last split (coinbaser_reuse)
+	/* Intentionally sent next-block script. Not produced yet; the label is ready for it. */
+	bool fallback_next_script;
 	unsigned char datum_job_idx;
 	unsigned char datum_coinbaser_id;
 } T_DATUM_STRATUM_JOB;
@@ -191,6 +193,7 @@ typedef struct T_DATUM_STRATUM_THREADPOOL_DATA {
 	int latest_stratum_job_index;
 	bool new_job;
 	bool last_was_empty;
+	bool replacing_provisional; /* previous job was stretch, solo, or fallback; blast the replacement */
 	int last_sent_job_state;
 	uint64_t loop_tsms;
 	bool full_coinbase_ready;
@@ -279,6 +282,10 @@ int send_mining_notify(T_DATUM_CLIENT_DATA *c, bool clean, bool quickdiff, bool 
  * and the split reply replace it. A later refresh does not. The replaced
  * job is not marked stale, so shares already submitted still count. */
 bool datum_stratum_notify_replaces_job(int job_state, bool opening_job_still_current);
+/* solo: self (mining.pool_address). pool: the pool's own split. stretch: the prior
+ * block's script scaled onto this tip. fallback: an intentionally sent next-block
+ * script (not produced yet). */
+const char *datum_stratum_work_kind(const T_DATUM_STRATUM_JOB *s);
 bool datum_stratum_holds_job(const T_DATUM_STRATUM_THREADPOOL_DATA *sdata, T_DATUM_STRATUM_JOB *job);
 bool datum_job_pays_current_pool(const T_DATUM_STRATUM_JOB *job);
 void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, int job_state);
