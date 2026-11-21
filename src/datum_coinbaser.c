@@ -965,6 +965,9 @@ void *datum_coinbaser_thread(void *ptr) {
 				sjob = global_latest_stratum_job_index;
 				if (s->need_coinbaser) {
 					need_coinbaser = true;
+#ifdef DATUM_FASTWAIT_TRACE
+					fw_stamp(&fw_trace.coinbaser_saw);
+#endif
 				}
 			} else {
 				need_coinbaser = false;

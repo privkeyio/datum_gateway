@@ -380,6 +380,9 @@ int datum_protocol_flush_socket(int sockfd) {
 	}
 	sent = send(sockfd, server_send_buffer, server_out_buf, MSG_DONTWAIT);
 	if (sent > 0) {
+#ifdef DATUM_FASTWAIT_TRACE
+		fw_stamp(&fw_trace.after_flush);
+#endif
 		if (sent < server_out_buf) {
 			memmove(server_send_buffer, server_send_buffer + sent,
 				server_out_buf - sent);
@@ -1396,6 +1399,19 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] = v;
 	datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx] = x;
 	
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.answer_seen);
+	if (fw_trace.dump_pending) {
+		uint64_t base = fw_trace.updating;
+		DLOG_INFO("fast-wait trace answer: answer=%" PRIu64 " us after Updating"
+		          " (flush=%" PRIu64 " send=%" PRIu64 ")",
+		          fw_trace.answer_seen - base,
+			  fw_trace.after_flush ? fw_trace.after_flush - base : 0,
+		          fw_trace.after_send ? fw_trace.after_send - base : 0);
+		fw_trace.dump_pending = false;
+	}
+#endif
+	
 	pthread_cond_signal(&datum_protocol_coinbaser_fetch_cond); // Signal the condition variable
 	datum_coinbaser_wake();
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
@@ -1429,6 +1445,32 @@ static uint64_t datum_last_req_session = 0;
 static bool datum_last_req_unanswered = false;
 
 #define DATUM_COINBASER_FAST_WAIT_MS 500
+
+#ifdef DATUM_FASTWAIT_TRACE
+T_FASTWAIT_TRACE fw_trace;
+
+void fw_stamp(uint64_t *slot) {
+	*slot = current_time_micros();
+}
+
+void fw_dump(void) {
+	const uint64_t base = fw_trace.updating;
+	fw_trace.dump_pending = true;
+	DLOG_INFO("fast-wait trace us from Updating: saw=%" PRIu64 " enter=%" PRIu64
+	          " exact=%" PRIu64 " send=%" PRIu64 " wake=%" PRIu64
+	          " wait=%" PRIu64 " flush=%" PRIu64 " answer=%" PRIu64
+		  " timeout_ms=%" PRIu64,
+	          fw_trace.coinbaser_saw - base,
+	          fw_trace.fetch_enter - base,
+	          fw_trace.after_exact - base,
+	          fw_trace.after_send - base,
+	          fw_trace.after_wake - base,
+	          fw_trace.before_wait - base,
+		  fw_trace.after_flush ? fw_trace.after_flush - base : 0,
+		  fw_trace.answer_seen ? fw_trace.answer_seen - base : 0,
+	          (fw_trace.timed_out - base) / 1000);
+}
+#endif
 
 /* Previous-block check: on a new tip, the block just found is read from
  * bitcoind. If its coinbase pays 2 or more of the saved split's scripts, the
@@ -2030,6 +2072,9 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	// here until that's ready or times out.
 	T_DATUM_STRATUM_JOB *s = (T_DATUM_STRATUM_JOB *)sptr;
 	uint64_t value = s->coinbase_value;
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.fetch_enter);
+#endif
 	unsigned char msg[128 + crypto_box_MACBYTES];
 	int i = 0;
 	int rc;
@@ -2068,6 +2113,9 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 			DLOG_INFO("Coinbaser: pool's split for this tip and value already held (%d outs, id %u)", exact, (unsigned)s->datum_coinbaser_id);
 			return exact;
 		}
+#ifdef DATUM_FASTWAIT_TRACE
+		fw_stamp(&fw_trace.after_exact);
+#endif
 	}
 	struct timespec ts_fast;
 	struct timespec ts_full;
@@ -2090,7 +2138,13 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 	datum_protocol_coinbaser_note_request(value, s->prevhash_bin, session_generation);
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.after_send);
+#endif
 	datum_protocol_wake();
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.after_wake);
+#endif
 	if (reuse_on) {
 		/* Read the previous block while the pool answers. The loop below looks
 		 * for an answer before waiting, so none is lost while unlocked. */
@@ -2109,15 +2163,24 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 			datum_last_req_unanswered = false;
 			break;
 		}
+#ifdef DATUM_FASTWAIT_TRACE
+		fw_stamp(&fw_trace.before_wait);
+#endif
 		rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);
 		if (rc == ETIMEDOUT) {
 			if (in_fast_wait) {
+#ifdef DATUM_FASTWAIT_TRACE
+				fw_stamp(&fw_trace.timed_out);
+#endif
 				int seeded;
 				pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 				datum_prev_check_wait(&ts_fast);
 				seeded = datum_protocol_coinbaser_try_reuse(s);
 				if (seeded >= 2) {
 					DLOG_INFO("Coinbaser fast-wait miss: publishing provisional multi (%d outs)", seeded);
+#ifdef DATUM_FASTWAIT_TRACE
+					fw_dump();
+#endif
 					return seeded;
 				}
 				if (datum_protocol_coinbaser_prev_stale(s->prevhash_bin)) {
