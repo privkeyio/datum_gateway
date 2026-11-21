@@ -249,6 +249,7 @@ int main(const int argc, const char * const * const argv) {
 	}
 	
 	DLOG_DEBUG("Starting template fetcher thread");
+	datum_stratum_init_empty_wake();
 	datum_blocktemplates_init_wake();
 	datum_blocktemplates_init_empty_wake();
 	datum_coinbaser_init_wake();
