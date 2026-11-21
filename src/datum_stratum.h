@@ -323,6 +323,7 @@ void datum_stratum_v1_socket_thread_client_new(T_DATUM_CLIENT_DATA *c);
 int datum_stratum_v1_global_subscriber_count(void);
 double datum_stratum_v1_est_total_th_sec(void);
 void datum_stratum_v1_shutdown_all(void);
+void datum_stratum_init_empty_wake(void);
 
 extern T_DATUM_SOCKET_APP *global_stratum_app;
 

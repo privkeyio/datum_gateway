@@ -45,7 +45,10 @@
 #include <errno.h>
 #include <jansson.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/eventfd.h>
 
 #include "datum_gateway.h"
 #include "datum_stratum.h"
@@ -77,6 +80,8 @@ uint64_t stratum_latest_empty_complete_count = 0;
 bool stratum_latest_empty_ready_for_full = 0;
 uint64_t stratum_latest_empty_job_index = 0;
 uint64_t stratum_latest_empty_sent_count = 0;
+static int stratum_empty_wake_fd = -1;
+static int stratum_empty_wake_write_fd = -1;
 
 pthread_rwlock_t need_coinbaser_rwlocks[MAX_STRATUM_JOBS];
 atomic_bool need_coinbaser_rwlocks_init_done = false;
@@ -86,13 +91,41 @@ uint64_t stratum_client_accepted_share_diff = 0;
 uint64_t stratum_client_rejected_share_count = 0;
 uint64_t stratum_client_rejected_share_diff = 0;
 
+void datum_stratum_init_empty_wake(void) {
+#ifdef __linux__
+	stratum_empty_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (stratum_empty_wake_fd >= 0)
+		stratum_empty_wake_write_fd = stratum_empty_wake_fd;
+#else
+	int pipefds[2];
+	if (pipe(pipefds) == 0) {
+		stratum_empty_wake_fd = pipefds[0];
+		stratum_empty_wake_write_fd = pipefds[1];
+		fcntl(stratum_empty_wake_fd, F_SETFL, O_NONBLOCK);
+		fcntl(stratum_empty_wake_write_fd, F_SETFL, O_NONBLOCK);
+		fcntl(stratum_empty_wake_fd, F_SETFD, FD_CLOEXEC);
+		fcntl(stratum_empty_wake_write_fd, F_SETFD, FD_CLOEXEC);
+	}
+#endif
+}
+
+static void datum_stratum_wake_empty(void) {
+	if (stratum_empty_wake_write_fd >= 0) {
+		uint64_t one = 1;
+		(void)write(stratum_empty_wake_write_fd, &one, sizeof(one));
+	}
+}
+
 void stratum_latest_empty_increment_complete(uint64_t index, int clients_notified) {
+	bool crossed = false;
 	pthread_rwlock_wrlock(&stratum_global_latest_empty_stat);
 	if ((stratum_latest_empty_job_index == index) && (!stratum_latest_empty_ready_for_full)) {
 		stratum_latest_empty_complete_count++;
 		stratum_latest_empty_sent_count += clients_notified;
+		if (global_stratum_app && stratum_latest_empty_complete_count >= global_stratum_app->datum_active_threads) crossed = true;
 	}
 	pthread_rwlock_unlock(&stratum_global_latest_empty_stat);
+	if (crossed) datum_stratum_wake_empty();
 }
 
 bool stratum_latest_empty_check_ready_for_full(void) {
@@ -329,31 +362,34 @@ void *datum_stratum_v1_socket_server(void *arg) {
 	global_stratum_app = app;
 	
 	while (1) {
+		if (stratum_empty_wake_fd >= 0) {
+			struct pollfd pfd = { .fd = stratum_empty_wake_fd, .events = POLLIN };
+			poll(&pfd, 1, -1); /* no safety timeout anymore */
+			uint64_t n;
+			while (read(stratum_empty_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+		} else {
+			usleep(11000);
+		}
 		// do periodic global stratum things here
 		
 		// If we're on an empty block waiting for a full one, handle that state transition here.
 		pthread_rwlock_wrlock(&stratum_global_latest_empty_stat);
-		if (!stratum_latest_empty_ready_for_full) {
-			// we're still on an empty wait-for-full
-			if (stratum_latest_empty_complete_count >= app->datum_active_threads) {
-				// we are done!
-				stratum_latest_empty_ready_for_full = true;
-				datum_blocktemplates_signal_empty_done();
-				{
-					const T_DATUM_STRATUM_JOB *ej = (stratum_latest_empty_job_index < MAX_STRATUM_JOBS) ? global_cur_stratum_jobs[stratum_latest_empty_job_index] : NULL;
-					DLOG_INFO("Empty work %s send completed. Sent to %llu clients across %llu threads", datum_stratum_work_kind(ej), (unsigned long long)stratum_latest_empty_sent_count, (unsigned long long)stratum_latest_empty_complete_count);
-				}
-				/* The threadpool threads check this flag inside their job loop.
-				 * Without a wake they sit in epoll_wait until the 1000ms timeout. */
-				for (int tid = 0; tid < app->max_threads; ++tid) {
-					if (app->datum_threads[tid].is_active)
-						datum_socket_wake_thread(&app->datum_threads[tid]);
-				}
+		if (!stratum_latest_empty_ready_for_full && stratum_latest_empty_complete_count >= app->datum_active_threads) {
+			// we are done!
+			stratum_latest_empty_ready_for_full = true;
+			datum_blocktemplates_signal_empty_done();
+			{
+				const T_DATUM_STRATUM_JOB *ej = (stratum_latest_empty_job_index < MAX_STRATUM_JOBS) ? global_cur_stratum_jobs[stratum_latest_empty_job_index] : NULL;
+				DLOG_INFO("Empty work %s send completed. Sent to %llu clients across %llu threads", datum_stratum_work_kind(ej), (unsigned long long)stratum_latest_empty_sent_count, (unsigned long long)stratum_latest_empty_complete_count);
+			}
+			/* The threadpool threads check this flag inside their job loop.
+			 * Without a wake they sit in epoll_wait until the 1000ms timeout. */
+			for (int tid = 0; tid < app->max_threads; ++tid) {
+				if (app->datum_threads[tid].is_active)
+					datum_socket_wake_thread(&app->datum_threads[tid]);
 			}
 		}
 		pthread_rwlock_unlock(&stratum_global_latest_empty_stat);
-		
-		usleep(11000);
 	}
 	
 	return NULL;
@@ -2236,6 +2272,7 @@ void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, i
 			stratum_latest_empty_job_index = 0;
 		}
 		pthread_rwlock_unlock(&stratum_global_latest_empty_stat);
+		datum_stratum_wake_empty();
 	}
 	
 	if (s->is_datum_job) {
