@@ -202,9 +202,17 @@ bool datum_blocktemplates_abw_ready(T_DATUM_TEMPLATE_DATA *block_template,
 	bool datum_active, bool abw_required);
 void *datum_gateway_template_thread(void *args);
 void datum_blocktemplates_notifynew_sighandler();
-void datum_blocktemplates_notifynew(const char *prevhash, int height);
+void datum_blocktemplates_notifynew(const char *prevhash, int height, const char *source);
 void datum_blocktemplates_notify_othercause();
 void datum_blocktemplates_notify_refresh(void);
 bool datum_blocktemplates_take_refresh(void);
+bool datum_blocktemplates_coinbaser_late_answer(const unsigned char *tip);
+bool datum_blocktemplates_release_hold(const unsigned char *tip);
+void datum_blocktemplates_prime_acked(void);
+void datum_blocktemplates_pool_unproven(void);
+void datum_blocktemplates_pool_proven(void);
+void datum_blocktemplates_init_wake(void);
+void datum_blocktemplates_init_empty_wake(void);
+void datum_blocktemplates_signal_empty_done(void);
 
 #endif

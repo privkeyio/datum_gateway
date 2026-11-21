@@ -67,6 +67,11 @@
 #include <netinet/tcp.h>
 #include <netinet/in.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 #include "datum_utils.h"
 #include "datum_protocol.h"
@@ -111,6 +116,8 @@ pthread_mutex_t datum_protocol_sender_stage1_lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t datum_protocol_send_buffer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t datum_protocol_migration_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t datum_protocol_current_migration_deadline_ms;
+static int protocol_wake_fd = -1;
+static int protocol_wake_write_fd = -1;
 
 #define DATUM_BULK_QUEUE_CAPACITY 2
 typedef struct {
@@ -182,6 +189,28 @@ extern DATUM_QUEUE pow_queue;
 
 // may be used by this thread when crafting replies to server commands
 unsigned char temp_data[DATUM_PROTOCOL_TEMP_DATA_SIZE];
+
+void datum_protocol_init_wake(void) {
+#ifdef __linux__
+	protocol_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+	if (protocol_wake_fd >= 0) protocol_wake_write_fd = protocol_wake_fd;
+#else
+	int pipefds[2];
+	if (pipe(pipefds) == 0) {
+		protocol_wake_fd = pipefds[0];
+		protocol_wake_write_fd = pipefds[1];
+		fcntl(protocol_wake_fd, F_SETFL, O_NONBLOCK);
+		fcntl(protocol_wake_write_fd, F_SETFL, O_NONBLOCK);
+	}
+#endif
+}
+
+void datum_protocol_wake(void) {
+	if (protocol_wake_write_fd >= 0) {
+		uint64_t one = 1;
+		(void)write(protocol_wake_write_fd, &one, sizeof(one));
+	}
+}
 
 void datum_protocol_reset_server_knowledge(void) {
 	pthread_rwlock_wrlock(&datum_jobs_rwlock);
@@ -351,6 +380,9 @@ int datum_protocol_flush_socket(int sockfd) {
 	}
 	sent = send(sockfd, server_send_buffer, server_out_buf, MSG_DONTWAIT);
 	if (sent > 0) {
+#ifdef DATUM_FASTWAIT_TRACE
+		fw_stamp(&fw_trace.after_flush);
+#endif
 		if (sent < server_out_buf) {
 			memmove(server_send_buffer, server_send_buffer + sent,
 				server_out_buf - sent);
@@ -421,6 +453,7 @@ static int datum_protocol_encrypted_cmd(uint8_t proto_cmd, const void *data,
 	pthread_mutex_unlock(&datum_protocol_send_buffer_lock);
 	pthread_mutex_unlock(&datum_protocol_sender_stage1_lock);
 	
+	datum_protocol_wake();
 	return 0;
 }
 
@@ -1131,7 +1164,7 @@ int datum_protocol_abw_activation(int len, unsigned char *data) {
 		const bool first_abw = !datum_abw_active_assignment_id;
 		datum_abw_active_assignment_id = assignment_id;
 		memcpy(datum_abw_active_key_hash, assignment->key_hash, 32);
-		if (first_abw) datum_blocktemplates_notifynew(NULL, 0);
+		if (first_abw) datum_blocktemplates_notifynew(NULL, 0, "prime");
 		activated = true;
 	}
 	pthread_mutex_unlock(&datum_abw_mutex);
@@ -1154,7 +1187,7 @@ int datum_protocol_abw_assignment_notice(int len, unsigned char *data) {
 		const bool first_abw = !datum_abw_active_assignment_id;
 		datum_abw_active_assignment_id = assignment_id;
 		memcpy(datum_abw_active_key_hash, data + 3, 32);
-		if (first_abw) datum_blocktemplates_notifynew(NULL, 0);
+		if (first_abw) datum_blocktemplates_notifynew(NULL, 0, "prime");
 	}
 	pthread_mutex_unlock(&datum_abw_mutex);
 	if (!installed) {
@@ -1274,7 +1307,7 @@ int datum_protocol_abw_reveal(int len, unsigned char *data) {
 		const bool pool_ignored = datum_config.mining_abw_verify_all_shares_on_disclosure && !pool_handled;
 		if (datum_submitblock_trigger_owned(block_request, block_hash)) {
 			++submitted;
-			datum_blocktemplates_notifynew(block_hash, 0);
+			datum_blocktemplates_notifynew(block_hash, 0, "prime");
 			DLOG_WARN("DATUM server revealed a verified block key for candidate %s",
 				block_hash);
 		} else {
@@ -1366,7 +1399,21 @@ int datum_protocol_coinbaser_fetch_response(int len, unsigned char *data) {
 	datum_coinbaser_v2_response_value[datum_coinbaser_v2_response_buf_idx] = v;
 	datum_coinbaser_v2_response_len[datum_coinbaser_v2_response_buf_idx] = x;
 	
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.answer_seen);
+	if (fw_trace.dump_pending) {
+		uint64_t base = fw_trace.updating;
+		DLOG_INFO("fast-wait trace answer: answer=%" PRIu64 " us after Updating"
+		          " (flush=%" PRIu64 " send=%" PRIu64 ")",
+		          fw_trace.answer_seen - base,
+			  fw_trace.after_flush ? fw_trace.after_flush - base : 0,
+		          fw_trace.after_send ? fw_trace.after_send - base : 0);
+		fw_trace.dump_pending = false;
+	}
+#endif
+	
 	pthread_cond_signal(&datum_protocol_coinbaser_fetch_cond); // Signal the condition variable
+	datum_coinbaser_wake();
 	pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 	
 	return 1;
@@ -1398,6 +1445,32 @@ static uint64_t datum_last_req_session = 0;
 static bool datum_last_req_unanswered = false;
 
 #define DATUM_COINBASER_FAST_WAIT_MS 500
+
+#ifdef DATUM_FASTWAIT_TRACE
+T_FASTWAIT_TRACE fw_trace;
+
+void fw_stamp(uint64_t *slot) {
+	*slot = current_time_micros();
+}
+
+void fw_dump(void) {
+	const uint64_t base = fw_trace.updating;
+	fw_trace.dump_pending = true;
+	DLOG_INFO("fast-wait trace us from Updating: saw=%" PRIu64 " enter=%" PRIu64
+	          " exact=%" PRIu64 " send=%" PRIu64 " wake=%" PRIu64
+	          " wait=%" PRIu64 " flush=%" PRIu64 " answer=%" PRIu64
+		  " timeout_ms=%" PRIu64,
+	          fw_trace.coinbaser_saw - base,
+	          fw_trace.fetch_enter - base,
+	          fw_trace.after_exact - base,
+	          fw_trace.after_send - base,
+	          fw_trace.after_wake - base,
+	          fw_trace.before_wait - base,
+		  fw_trace.after_flush ? fw_trace.after_flush - base : 0,
+		  fw_trace.answer_seen ? fw_trace.answer_seen - base : 0,
+	          (fw_trace.timed_out - base) / 1000);
+}
+#endif
 
 /* Previous-block check: on a new tip, the block just found is read from
  * bitcoind. If its coinbase pays 2 or more of the saved split's scripts, the
@@ -1844,6 +1917,8 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	} else {
 		DLOG_INFO("Coinbaser: prev-block check: pool block=%s in %" PRIu64 " ms (%d of %d split outputs paid%s)", pool_block ? "yes" : "no", current_time_millis() - start, matched, n, paid_pool ? ", pool script paid" : "");
 	}
+	datum_coinbaser_arm_solo_log();
+
 	return pool_block;
 }
 
@@ -1997,6 +2072,9 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 	// here until that's ready or times out.
 	T_DATUM_STRATUM_JOB *s = (T_DATUM_STRATUM_JOB *)sptr;
 	uint64_t value = s->coinbase_value;
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.fetch_enter);
+#endif
 	unsigned char msg[128 + crypto_box_MACBYTES];
 	int i = 0;
 	int rc;
@@ -2035,6 +2113,9 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 			DLOG_INFO("Coinbaser: pool's split for this tip and value already held (%d outs, id %u)", exact, (unsigned)s->datum_coinbaser_id);
 			return exact;
 		}
+#ifdef DATUM_FASTWAIT_TRACE
+		fw_stamp(&fw_trace.after_exact);
+#endif
 	}
 	struct timespec ts_fast;
 	struct timespec ts_full;
@@ -2057,6 +2138,13 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 		return 0;
 	}
 	datum_protocol_coinbaser_note_request(value, s->prevhash_bin, session_generation);
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.after_send);
+#endif
+	datum_protocol_wake();
+#ifdef DATUM_FASTWAIT_TRACE
+	fw_stamp(&fw_trace.after_wake);
+#endif
 	if (reuse_on) {
 		/* Read the previous block while the pool answers. The loop below looks
 		 * for an answer before waiting, so none is lost while unlocked. */
@@ -2075,15 +2163,24 @@ int datum_protocol_coinbaser_fetch(void *sptr) {
 			datum_last_req_unanswered = false;
 			break;
 		}
+#ifdef DATUM_FASTWAIT_TRACE
+		fw_stamp(&fw_trace.before_wait);
+#endif
 		rc = pthread_cond_timedwait(&datum_protocol_coinbaser_fetch_cond, &datum_protocol_coinbaser_fetch_mutex, &ts);
 		if (rc == ETIMEDOUT) {
 			if (in_fast_wait) {
+#ifdef DATUM_FASTWAIT_TRACE
+				fw_stamp(&fw_trace.timed_out);
+#endif
 				int seeded;
 				pthread_mutex_unlock(&datum_protocol_coinbaser_fetch_mutex);
 				datum_prev_check_wait(&ts_fast);
 				seeded = datum_protocol_coinbaser_try_reuse(s);
 				if (seeded >= 2) {
 					DLOG_INFO("Coinbaser fast-wait miss: publishing provisional multi (%d outs)", seeded);
+#ifdef DATUM_FASTWAIT_TRACE
+					fw_dump();
+#endif
 					return seeded;
 				}
 				if (datum_protocol_coinbaser_prev_stale(s->prevhash_bin)) {
@@ -2258,6 +2355,7 @@ err:
 		DLOG_INFO("DATUM connection resumed with Prime ID %16.16"PRIx64,
 			datum_config.prime_id);
 		datum_protocol_replay_unanswered();
+		datum_blocktemplates_pool_unproven();
 	} else if (first_configuration && datum_requested_resume) {
 		DLOG_WARN("DATUM resume was declined; discarded queued shares from the old session");
 	}
@@ -2743,6 +2841,7 @@ int datum_protocol_share_response(const int len, unsigned char * const data) {
 			++datum_accepted_share_count;
 			datum_protocol_add_share_diff(&datum_accepted_share_diff, target_pot);
 			datum_last_accepted_share_tsms = datum_protocol_mainloop_tsms;
+			datum_blocktemplates_pool_proven();
 			
 			break;
 		}
@@ -3006,7 +3105,8 @@ int datum_protocol_mining_cmd5(T_DATUM_PROTOCOL_HEADER *h, unsigned char *data) 
 		case 0xF9: {
 			// Server says we should check for a new block template immediately
 			DLOG_DEBUG("DATUM server blocknotify");
-			datum_blocktemplates_notifynew(NULL, 0);
+			datum_blocktemplates_notifynew(NULL, 0, "prime");
+			datum_blocktemplates_pool_proven();
 			return 1;
 			break;
 		}
@@ -3444,9 +3544,11 @@ int datum_protocol_pow_submit(
 	//DLOG_DEBUG("ADD: DATUM POW: time %d nonce %8.8X", pow.ntime, pow.nonce);
 	
 	const int queued = datum_queue_add_item(&pow_queue, &pow);
+	if (queued == 0) datum_protocol_wake();
 	if (queued != 0 && pow.abw_assignment_id) {
 		datum_protocol_abw_forget_exact(pow.abw_assignment_id, pow.raw_pow_hash);
 	}
+	
 	return queued;
 }
 
@@ -3836,6 +3938,11 @@ void *datum_protocol_client(void *args) {
 		return NULL;
 	}
 	
+	if (protocol_wake_fd >= 0) {
+		struct epoll_event ev = { .events = EPOLLIN, .data.fd = protocol_wake_fd };
+		epoll_ctl(epollfd, EPOLL_CTL_ADD, protocol_wake_fd, &ev);
+	}
+	
 	ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
 	ev.data.fd = sockfd;
 	
@@ -3846,6 +3953,7 @@ void *datum_protocol_client(void *args) {
 		datum_protocol_client_active = 0;
 		return NULL;
 	}
+	bool socket_out_armed = false;
 	i = 0;
 	datum_last_accepted_share_tsms = 0;
 	datum_last_accepted_share_local_tsms = 0;
@@ -3888,6 +3996,20 @@ void *datum_protocol_client(void *args) {
 		
 		if (datum_protocol_flush_socket(sockfd)) break;
 		
+		if (server_out_buf && !socket_out_armed) {
+			struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP, .data.fd = sockfd };
+			if (epoll_ctl(epollfd, EPOLL_CTL_MOD, sockfd, &ev) == 0) {
+				socket_out_armed = true;
+#ifdef DATUM_FASTWAIT_TRACE
+				DLOG_INFO("protocol: armed EPOLLOUT, %d bytes pending", server_out_buf);
+#endif
+			}
+		} else if (!server_out_buf && socket_out_armed) {
+			struct epoll_event ev = { .events = EPOLLIN | EPOLLERR | EPOLLHUP, .data.fd = sockfd };
+			if (epoll_ctl(epollfd, EPOLL_CTL_MOD, sockfd, &ev) == 0)
+				socket_out_armed = false;
+		}
+		
 		break_again = false;
 		// Basic state machine for connection setup
 		switch(datum_state) {
@@ -3925,7 +4047,13 @@ void *datum_protocol_client(void *args) {
 		
 		if (break_again) break;
 		
-		nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, 5);  // Wait for 5ms
+		int timeout = (datum_state == 3 || !datum_config.datum_pool_host[0]) ? 1000 : 5;
+		//nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, timeout);
+		/* A packet or wake that arrived while we were doing the
+		 * pre-wait work must not be slept past. Probe first. */
+		nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, 0);
+		if (nfds == 0)
+			nfds = epoll_wait(epollfd, events, MAX_DATUM_CLIENT_EVENTS, timeout);
 		
 		if (nfds == -1 && errno != EINTR) {
 			DLOG_FATAL("epoll_wait(...) error: %s",strerror(errno));
@@ -3936,11 +4064,44 @@ void *datum_protocol_client(void *args) {
 			continue;  // Timeout, nothing happened
 		}
 		
-		if (events[0].events & (EPOLLERR | EPOLLHUP)) {
+		bool socket_ready = false;
+		bool socket_error = false;
+		for (int i = 0; i < nfds; i++) {
+			if (events[i].data.fd == protocol_wake_fd) {
+				uint64_t n;
+				while (read(protocol_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+				datum_protocol_flush_socket(sockfd);
+				if (server_out_buf && !socket_out_armed) {
+					struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP, .data.fd = sockfd };
+					if (epoll_ctl(epollfd, EPOLL_CTL_MOD, sockfd, &ev) == 0) socket_out_armed = true;
+				} else if (!server_out_buf && socket_out_armed) {
+					struct epoll_event ev = { .events = EPOLLIN | EPOLLERR | EPOLLHUP, .data.fd = sockfd };
+					if (epoll_ctl(epollfd, EPOLL_CTL_MOD, sockfd, &ev) == 0) socket_out_armed = false;
+				}
+			} else if (events[i].data.fd == sockfd) {
+				if (events[i].events & (EPOLLERR | EPOLLHUP)) socket_error = true;
+				if (events[i].events & EPOLLIN) socket_ready = true;
+				if (events[i].events & EPOLLOUT) {
+#ifdef DATUM_FASTWAIT_TRACE
+					DLOG_INFO("protocol: EPOLLOUT fired, %d bytes pending", server_out_buf);
+#endif
+					datum_protocol_flush_socket(sockfd);
+					if (server_out_buf && !socket_out_armed) {
+						struct epoll_event ev = { .events = EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP, .data.fd = sockfd };
+						if (epoll_ctl(epollfd, EPOLL_CTL_MOD, sockfd, &ev) == 0) socket_out_armed = true;
+					} else if (!server_out_buf && socket_out_armed) {
+						struct epoll_event ev = { .events = EPOLLIN | EPOLLERR | EPOLLHUP, .data.fd = sockfd };
+						if (epoll_ctl(epollfd, EPOLL_CTL_MOD, sockfd, &ev) == 0) socket_out_armed = false;
+					}
+				}
+			}
+		}
+		
+		if (socket_error) {
 			int err = 0;
 			socklen_t errlen = sizeof(err);
 			
-			if (getsockopt(events[0].data.fd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0) {
+			if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &errlen) == 0) {
 				if (err != 0) {
 					DLOG_ERROR("Socket error: %s", strerror(err));
 				} else {
@@ -3952,7 +4113,7 @@ void *datum_protocol_client(void *args) {
 			break;
 		}
 		
-		if (events[0].events & EPOLLIN) {
+		if (socket_ready) {
 			// data to receive
 			break_again = false;
 			// Receive the header, followed by any data specified by the header
