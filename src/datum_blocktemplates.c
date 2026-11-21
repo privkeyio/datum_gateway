@@ -827,6 +827,9 @@ void *datum_gateway_template_thread(void *args) {
 							pthread_mutex_unlock(&pool_tip_lock);
 							const T_DATUM_STRATUM_JOB *sj = global_cur_stratum_jobs[global_latest_stratum_job_index];
 							DLOG_INFO("Updating standard %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(sj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
+#ifdef DATUM_FASTWAIT_TRACE
+							fw_stamp(&fw_trace.updating);
+#endif
 						}
 					}
 				}

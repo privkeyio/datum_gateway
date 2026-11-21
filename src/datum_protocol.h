@@ -198,6 +198,26 @@ bool datum_protocol_abw_apply_active(T_DATUM_TEMPLATE_DATA *block_template);
 bool datum_protocol_abw_health_ok(void);
 void datum_protocol_init_wake(void);
 
+#ifdef DATUM_FASTWAIT_TRACE
+typedef struct {
+	uint64_t updating;
+	uint64_t coinbaser_saw;
+	uint64_t saw_update;
+	uint64_t fetch_enter;
+	uint64_t after_exact;
+	uint64_t after_send;
+	uint64_t after_wake;
+	uint64_t before_wait;
+	uint64_t timed_out;
+	uint64_t after_flush;   // actual socket write
+	uint64_t answer_seen;   // pool's coinbaser response fully processed
+	bool dump_pending;
+} T_FASTWAIT_TRACE;
+extern T_FASTWAIT_TRACE fw_trace;
+void fw_stamp(uint64_t *slot);
+void fw_dump(void);
+#endif
+
 extern uint64_t datum_accepted_share_count;
 extern uint64_t datum_accepted_share_diff;
 extern uint64_t datum_rejected_share_count;
