@@ -836,7 +836,7 @@ void *datum_gateway_listener_thread(void *arg) {
 	DLOG_INFO("DATUM Socket listener thread active for '%s'", app->name);
 	
 	for (;;) {
-		nfds = epoll_wait(epollfd, events, MAX_EVENTS, 100);
+		nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
 		if (nfds) {
 			if (datum_config.datum_pooled_mining_only && (!datum_protocol_is_active())) {
 				curtime_tsms = current_time_millis(); // we only need this if we're rejecting connections
