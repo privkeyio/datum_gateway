@@ -46,6 +46,11 @@
 #include <curl/curl.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <poll.h>
+#include <fcntl.h>
+#ifdef __linux__
+#include <sys/eventfd.h>
+#endif
 
 #include "datum_conf.h"
 #include "datum_pow.h"
@@ -56,9 +61,40 @@
 #include "datum_coinbaser.h"
 #include "datum_blocktemplates.h"
 
+
+
 CURL *coinbaser_curl = NULL;
 
 const char *cbstart_hex = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff"; // 82 len hex, 41 bytes
+static bool solo_log_armed = true;
+static int coinbaser_wake_fd = -1;
+static int coinbaser_wake_write_fd = -1;
+
+void datum_coinbaser_init_wake(void) {
+#ifdef __linux__
+    coinbaser_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (coinbaser_wake_fd >= 0) coinbaser_wake_write_fd = coinbaser_wake_fd;
+#else
+    int pipefds[2];
+    if (pipe(pipefds) == 0) {
+        coinbaser_wake_fd = pipefds[0];
+        coinbaser_wake_write_fd = pipefds[1];
+        fcntl(coinbaser_wake_fd, F_SETFL, O_NONBLOCK);
+        fcntl(coinbaser_wake_write_fd, F_SETFL, O_NONBLOCK);
+    }
+#endif
+}
+
+void datum_coinbaser_wake(void) {
+    if (coinbaser_wake_write_fd >= 0) {
+        uint64_t one = 1;
+        (void)write(coinbaser_wake_write_fd, &one, sizeof(one));
+    }
+}
+
+void datum_coinbaser_arm_solo_log(void) {
+	solo_log_armed = true;
+}
 
 int generate_coinbase_data(int height, uint8_t *cb, int *target_pot_index, bool datum_active) {
 	int coinbase_data_size = 0;
@@ -428,14 +464,20 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		!datum_protocol_abw_scaled_reuse_ok() &&
 		!datum_protocol_coinbaser_exact_ready(s);
 	const bool solo_until_first_split = no_split || prev_solo || abw_solo;
-	if (no_split) {
-		DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
-	} else if (prev_solo == 1) {
-		DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
-	} else if (prev_solo) {
-		DLOG_INFO("Coinbaser: previous block not verified; this job pays mining.pool_address until it is or the pool answers");
-	} else if (abw_solo) {
-		DLOG_INFO("Coinbaser: ABW template; paying mining.pool_address until the pool's own split");
+	if (solo_log_armed) {
+		if (no_split) {
+			DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
+			solo_log_armed = false;
+		} else if (prev_solo == 1) {
+			DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
+			solo_log_armed = false;
+		} else if (prev_solo) {
+			DLOG_INFO("Coinbaser: previous block not verified; this job pays mining.pool_address until it is or the pool answers");
+			solo_log_armed = false;
+		} else if (abw_solo) {
+			DLOG_INFO("Coinbaser: ABW template; paying mining.pool_address until the pool's own split");
+			solo_log_armed = false;
+		}
 	}
 	s->solo_while_connected = false;
 	if (datum_protocol_is_active() && !solo_until_first_split) {
@@ -910,6 +952,7 @@ void *datum_coinbaser_thread(void *ptr) {
 	T_DATUM_STRATUM_JOB *s = NULL;
 	bool need_coinbaser = false;
 	int i;
+	int timeout_ms = datum_config.bitcoind_work_update_seconds * 2 * 1000;
 	
 	DLOG_DEBUG("Coinbaser thread active");
 	
@@ -923,6 +966,9 @@ void *datum_coinbaser_thread(void *ptr) {
 				sjob = global_latest_stratum_job_index;
 				if (s->need_coinbaser) {
 					need_coinbaser = true;
+#ifdef DATUM_FASTWAIT_TRACE
+					fw_stamp(&fw_trace.coinbaser_saw);
+#endif
 				}
 			} else {
 				need_coinbaser = false;
@@ -955,6 +1001,14 @@ void *datum_coinbaser_thread(void *ptr) {
 					}
 				}
 				DLOG_DEBUG("Generated and notified.");
+				/* Pool answered for this exact tip and value. A provisional
+				 * reuse does not set exact_ready, so it cannot release.
+				 * The tip check inside release_hold rejects a parse for a
+				 * tip that is no longer the held one. */
+				if (i >= 2 && datum_protocol_is_active() &&
+				    datum_protocol_coinbaser_exact_ready(s)) {
+					if (datum_blocktemplates_release_hold(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on exact parse");
+				}
 				if (datum_protocol_coinbaser_reuse_active() && !s->is_datum_job && i >= 2 && datum_protocol_is_active()) {
 					// solo until first split: the first split is saved, so move miners onto pooled work
 					DLOG_INFO("Coinbaser: first split received; replacing solo work with pooled work");
@@ -967,13 +1021,22 @@ void *datum_coinbaser_thread(void *ptr) {
 			unsigned char late_tip[32];
 			if (datum_protocol_coinbaser_reuse_active() &&
 			    datum_protocol_coinbaser_take_late(late_tip) >= 2 && s && memcmp(s->prevhash_bin, late_tip, 32) == 0) {
-				/* Reuse off does not refresh. A pool slower than 5s would
-				 * otherwise blast new work on every timeout. */
-				datum_blocktemplates_notify_refresh();
+				if (datum_protocol_coinbaser_exact_ready(s)) {
+					if (datum_blocktemplates_coinbaser_late_answer(s->prevhash_bin)) DLOG_INFO("Coinbaser: RELEASE hold on late answer");
+				}
+				else datum_blocktemplates_notify_refresh();
+				datum_coinbaser_wake();
 			}
 		}
 		
-		usleep(12000);
+		if (coinbaser_wake_fd >= 0) {
+			struct pollfd pfd = { .fd = coinbaser_wake_fd, .events = POLLIN };
+			if (poll(&pfd, 1, timeout_ms) == 0) DLOG_ERROR("Coinbaser wait timed out after %d s; no job update wake", datum_config.bitcoind_work_update_seconds * 2);
+			uint64_t n;
+			while (read(coinbaser_wake_fd, &n, sizeof(n)) == (ssize_t)sizeof(n));
+		} else {
+			usleep(12000);
+		}
 	}
 }
 
