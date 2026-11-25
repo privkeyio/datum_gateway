@@ -852,6 +852,12 @@ void *datum_gateway_listener_thread(void *arg) {
 			if (events[n].data.fd == listen_socks[0] || events[n].data.fd == listen_socks[1]) {
 				conn_sock = accept(events[n].data.fd, NULL, NULL);
 				if (conn_sock < 0) {
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+					if (errno == ECONNABORTED || errno == ECONNRESET) {
+						DLOG_DEBUG("accept aborted/reset before dequeue: %s", strerror(errno));
+						continue;
+					}
+#endif
 					DLOG_ERROR("accept failed: %s", strerror(errno));
 					continue;
 				}
@@ -869,7 +875,9 @@ void *datum_gateway_listener_thread(void *arg) {
 				
 				DLOG_DEBUG("Accepted socket to fd %d", conn_sock);
 				if (!datum_socket_setoptions(conn_sock)) {
-					DLOG_ERROR("datum_socket_setoptions failed for incoming connection on fd %d", conn_sock);
+					if (errno != EINVAL && errno != ECONNRESET && errno != ENOTCONN && errno != EBADF) {
+						DLOG_ERROR("datum_socket_setoptions failed for incoming connection on fd %d", conn_sock);
+					}
 					close(conn_sock);
 					continue;
 				}
@@ -909,6 +917,12 @@ bool datum_socket_setoptions(int sock) {
 	
 	// Set the TCP_NODELAY option
 	if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (void *)&flag, sizeof(flag)) < 0) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+               if (errno == EINVAL || errno == ECONNRESET || errno == ENOTCONN || errno == EBADF) {
+                       DLOG_DEBUG("setsockopt(TCP_NODELAY) skipped on closing socket: %s", strerror(errno));
+                       return false;
+               }
+#endif
 		DLOG_WARN("setsockopt(TCP_NODELAY) failed: %s", strerror(errno));
 	}
 	
