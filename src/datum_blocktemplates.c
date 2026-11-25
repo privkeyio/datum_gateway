@@ -818,18 +818,27 @@ void *datum_gateway_template_thread(void *args) {
 						// Gated early bailout, prevents edge case of a very late prime having a standard job created which will make reject shares.
 						} else if (!atomic_load(&pool_tip_acked) && datum_protocol_is_active()) { DLOG_INFO("Holding standard job: waiting for prime notification of this tip");
 						} else {
-							i = datum_stratum_v1_global_subscriber_count();
-							const bool refresh = datum_blocktemplates_take_refresh();
-							const bool split_held = refresh && datum_protocol_coinbaser_have_saved();
-							update_stratum_job(t,false,split_held ? JOB_STATE_FULL_PRIORITY_WAIT_COINBASER : JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
-							pthread_mutex_lock(&pool_tip_lock);
-							prime_since_block = false;
-							pthread_mutex_unlock(&pool_tip_lock);
-							const T_DATUM_STRATUM_JOB *sj = global_cur_stratum_jobs[global_latest_stratum_job_index];
-							DLOG_INFO("Updating standard %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(sj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
+							const T_DATUM_STRATUM_JOB *prev = global_cur_stratum_jobs[global_latest_stratum_job_index];
+							if (prev && (current_time_millis() - prev->tsms) < 30000 &&
+							    memcmp(prev->prevhash_bin, t->previousblockhash_bin, 32) == 0 &&
+							    prev->coinbase_value == t->coinbasevalue &&
+							    datum_stratum_drop_if_identical(t)) {
+								DLOG_DEBUG("Skipping standard job update; recent identical job still active");
+								// fall through to the wait at the bottom;
+							} else {
+								i = datum_stratum_v1_global_subscriber_count();
+								const bool refresh = datum_blocktemplates_take_refresh();
+								const bool split_held = refresh && datum_protocol_coinbaser_have_saved();
+								update_stratum_job(t,false,split_held ? JOB_STATE_FULL_PRIORITY_WAIT_COINBASER : JOB_STATE_FULL_NORMAL_WAIT_COINBASER);
+								pthread_mutex_lock(&pool_tip_lock);
+								prime_since_block = false;
+								pthread_mutex_unlock(&pool_tip_lock);
+								const T_DATUM_STRATUM_JOB *sj = global_cur_stratum_jobs[global_latest_stratum_job_index];
+								DLOG_INFO("Updating standard %s job: %.8f BTC,%4lu txns,%7lu bytes, %llu client%s (%lu)", datum_stratum_work_kind(sj), (double)t->coinbasevalue / (double)100000000.0, (unsigned long)t->txn_count, (unsigned long)t->txn_total_size, (unsigned long long)i, (i!=1)?"s":"", (unsigned long)t->height);
 #ifdef DATUM_FASTWAIT_TRACE
-							fw_stamp(&fw_trace.updating);
+								fw_stamp(&fw_trace.updating);
 #endif
+							}
 						}
 					}
 				}

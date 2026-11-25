@@ -440,6 +440,10 @@ int datum_stratum_coinbase_fit_to_template(int max_sz, int fixed_bytes, T_DATUM_
 }
 
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block) {
+	generate_base_coinbase_txns_for_stratum_job_(s, new_block, false);
+}
+
+void generate_base_coinbase_txns_for_stratum_job_(T_DATUM_STRATUM_JOB *s, bool new_block, bool quiet) {
 	uint8_t *cb = s->coinbase_data;
 	int coinbase_data_size = 0;
 	bool space_for_en_in_coinbase = false;
@@ -465,16 +469,16 @@ void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool ne
 		!datum_protocol_coinbaser_exact_ready(s);
 	const bool solo_until_first_split = no_split || prev_solo || abw_solo;
 	if (solo_log_armed) {
-		if (no_split) {
+		if (!quiet && no_split) {
 			DLOG_INFO("Coinbaser: no split from this pool yet; this job pays mining.pool_address until one arrives");
 			solo_log_armed = false;
-		} else if (prev_solo == 1) {
+		} else if (!quiet && prev_solo == 1) {
 			DLOG_INFO("Coinbaser: the pool found the previous block; this job pays mining.pool_address until the pool answers");
 			solo_log_armed = false;
-		} else if (prev_solo) {
+		} else if (!quiet && prev_solo) {
 			DLOG_INFO("Coinbaser: previous block not verified; this job pays mining.pool_address until it is or the pool answers");
 			solo_log_armed = false;
-		} else if (abw_solo) {
+		} else if (!quiet && abw_solo) {
 			DLOG_INFO("Coinbaser: ABW template; paying mining.pool_address until the pool's own split");
 			solo_log_armed = false;
 		}

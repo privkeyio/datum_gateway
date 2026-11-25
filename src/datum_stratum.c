@@ -2153,6 +2153,32 @@ void datum_stratum_job_refresh_blake2b(T_DATUM_STRATUM_JOB *s) {
 	s->prevhash[64] = 0;
 }
 
+/* Called only after the template thread has matched tip and value.
+ * Builds the coinbase script and compares it to the previous job.
+ * Returns true to drop, false to hand off to update_stratum_job. */
+bool datum_stratum_drop_if_identical(const T_DATUM_TEMPLATE_DATA *t) {
+	T_DATUM_STRATUM_JOB tmp;
+	const T_DATUM_STRATUM_JOB *prev;
+	if (!t) return false;
+	prev = global_cur_stratum_jobs[global_latest_stratum_job_index];
+	if (!prev || prev->coinbase_data_len == 0) return false;
+	if ((current_time_millis() - prev->tsms) >= 30000) return false;
+	if (memcmp(prev->prevhash_bin, t->previousblockhash_bin, 32) != 0) return false;
+	if (prev->coinbase_value != t->coinbasevalue) return false;
+
+	memset(&tmp, 0, sizeof(tmp));
+	tmp.block_template = (T_DATUM_TEMPLATE_DATA *)t;
+	tmp.coinbase_value = t->coinbasevalue;
+	memcpy(tmp.prevhash_bin, t->previousblockhash_bin, 32);
+	tmp.is_new_block = false;
+	generate_base_coinbase_txns_for_stratum_job_(&tmp, false, true);
+
+	if (tmp.coinbase_data_len != prev->coinbase_data_len) return false;
+	if (memcmp(tmp.coinbase_data, prev->coinbase_data, prev->coinbase_data_len) != 0) return false;
+	if (tmp.provisional_split != prev->provisional_split) return false;
+	return true;
+}
+
 void update_stratum_job(T_DATUM_TEMPLATE_DATA *block_template, bool new_block, int job_state) {
 	T_DATUM_STRATUM_JOB *s = &stratum_job_list[stratum_job_next];
 	int i;

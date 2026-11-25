@@ -49,6 +49,7 @@ int datum_script_sigop_cost(const unsigned char *script, int len);
 void generate_coinbase_txns_for_stratum_job_subtypebysize(T_DATUM_STRATUM_JOB *s, int coinbase_index, int remaining_size, bool space_for_en_in_coinbase, int *cb1idx, int *cb2idx, bool special_coinb1);
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only);
 void generate_base_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool new_block);
+void generate_base_coinbase_txns_for_stratum_job_(T_DATUM_STRATUM_JOB *s, bool new_block, bool quiet);
 int datum_coinbaser_v2_parse(T_DATUM_STRATUM_JOB *s, unsigned char *coinbaser, int cblen);
 void datum_coinbaser_arm_solo_log(void);
 void datum_coinbaser_init_wake(void);

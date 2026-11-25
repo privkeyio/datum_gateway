@@ -309,6 +309,7 @@ bool datum_stratum_abw_finalize_block_request(char *request, size_t request_size
 	uint8_t xor_clear_bits, const uint8_t xor_key[16],
 	const uint8_t expected_pow_hash[32], char block_hash_hex[65]);
 void generate_coinbase_txns_for_stratum_job(T_DATUM_STRATUM_JOB *s, bool empty_only);
+bool datum_stratum_drop_if_identical(const T_DATUM_TEMPLATE_DATA *t);
 int send_mining_set_difficulty(T_DATUM_CLIENT_DATA *c);
 bool stratum_latest_empty_check_ready_for_full(void);
 
