@@ -201,6 +201,16 @@ int main(const int argc, const char * const * const argv) {
 	}
 	datum_gateway_config_filename = arguments.config_file;
 	
+	/* XOR the lower 16 bits of startup millis into the coinbase unique ID so
+	 * multiple instances that share a config (or the default 4242) do not
+	 * present the same ID to the pool even if they start in the same second.
+	 * The pool keys sessions by this value. */
+	if (datum_config.coinbase_unique_id == 4242) {
+		datum_config.coinbase_unique_id ^= (int)(current_time_millis() & 0xFFFF);
+		if (datum_config.coinbase_unique_id == 0)
+			datum_config.coinbase_unique_id = 1;
+	}
+	
 	// Initialize logger thread
 	if (datum_logger_init()) {
 		DLOG_FATAL("Error initializing the logger!");
