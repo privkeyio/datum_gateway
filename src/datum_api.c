@@ -1787,7 +1787,7 @@ enum MHD_Result datum_api_testnet_fastforward(struct MHD_Connection * const conn
 		t = (int)strtoul(time_str, NULL, 10);
 	}
 	
-	datum_blocktemplates_notifynew("T", t);
+	datum_blocktemplates_notifynew("T", t, "api");
 	return datum_api_OK(connection);
 }
 
@@ -1904,7 +1904,7 @@ enum MHD_Result datum_api_answer(void *cls, struct MHD_Connection *connection, c
 		case 'N': {
 			if (!strcmp(url, "/NOTIFY")) {
 				// TODO: Implement faster notifies with hash+height
-				datum_blocktemplates_notifynew(NULL, 0);
+				datum_blocktemplates_notifynew(NULL, 0, "node");
 				return datum_api_OK(connection);
 			}
 			break;

@@ -391,8 +391,9 @@ int datum_thread_create(pthread_t *thread, void *(*start_routine)(void *), void 
 }
 
 void panic_from_thread(int a) {
-	// set panic flag
+	// set panic flag and trigger logger event wake
 	panic_mode = 1;
+	datum_logger_wake();
 	
 	printf("PANIC TRIGGERED - %d\n",a);
 	fflush(stdout);
