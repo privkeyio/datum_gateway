@@ -1900,13 +1900,32 @@ bool datum_protocol_coinbaser_check_prev_block(const unsigned char *tip) {
 	hex = r ? json_string_value(json_object_get(r, "result")) : NULL;
 	if (hex) matched = datum_protocol_coinbaser_prev_block_matches(hex, strlen(hex), outs, n, parent, pool_script, pool_len, &paid_pool);
 	if (r) json_decref(r);
-	pool_block = matched >= 2 || (matched >= 0 && paid_pool);
+	bool split_has_pool = false;
+	if (pool_len > 0) {
+		for (int i = 0; i < n; i++) {
+			if ((int)outs[i].output_script_len == pool_len &&
+			    memcmp(outs[i].output_script, pool_script, (size_t)pool_len) == 0) {
+				split_has_pool = true;
+				break;
+			}
+		}
+	}
+	pool_block = split_has_pool ? paid_pool : (matched > n / 2);
 	// a split older than the block's parent may have been paid by a block in between
 	const bool not_child = matched >= 0 && !pool_block && memcmp(parent, split_tip, 32) != 0;
 
+	/* datum_prev_pool_block_locked is still datum_prev_paid >= 2.
+	 * Record 2 when the new verdict says pool block and the match
+	 * count is under 2; record at most 1 otherwise. Otherwise a
+	 * 2-of-80 with no pool script stores 2, the job goes solo,
+	 * and the log says pool block=no. */
+	int recorded = matched;
+	if (pool_block && matched < 2) recorded = 2;
+	else if (!pool_block && matched >= 2) recorded = 1;
+
 	pthread_mutex_lock(&datum_last_good_cb_mutex);
 	// a split saved while bitcoind was asked is not the one this read is about: read again
-	datum_prev_record_locked(tip, gen != datum_last_good_gen ? DATUM_PREV_UNREAD : not_child ? DATUM_PREV_NOT_CHILD : (pool_block && matched < 2) ? 2 : matched);
+	datum_prev_record_locked(tip, gen != datum_last_good_gen ? DATUM_PREV_UNREAD : not_child ? DATUM_PREV_NOT_CHILD : recorded);
 	pthread_mutex_unlock(&datum_last_good_cb_mutex);
 	datum_prev_check_wake_fetch();
 
