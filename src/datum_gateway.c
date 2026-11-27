@@ -113,12 +113,12 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state) {
 			break;
 		case 0x101:  // test
 			datum_sockets_eventfd_tests();
+			datum_blocktemplates_tests();
 			datum_utils_tests();
 			datum_conf_tests();
 #ifdef ENABLE_API
 			datum_api_tests();
 #endif
-			datum_blocktemplates_tests();
 			datum_coinbaser_tests();
 			datum_parent_fetch_tests();
 			datum_pow_tests();
@@ -201,6 +201,16 @@ int main(const int argc, const char * const * const argv) {
 	}
 	datum_gateway_config_filename = arguments.config_file;
 	
+	/* XOR the lower 16 bits of startup millis into the coinbase unique ID so
+	 * multiple instances that share a config (or the default 4242) do not
+	 * present the same ID to the pool even if they start in the same second.
+	 * The pool keys sessions by this value. */
+	if (datum_config.coinbase_unique_id == 4242) {
+		datum_config.coinbase_unique_id ^= (int)(current_time_millis() & 0xFFFF);
+		if (datum_config.coinbase_unique_id == 0)
+			datum_config.coinbase_unique_id = 1;
+	}
+	
 	// Initialize logger thread
 	if (datum_logger_init()) {
 		DLOG_FATAL("Error initializing the logger!");
@@ -230,6 +240,7 @@ int main(const int argc, const char * const * const argv) {
 		exit(1);
 	}
 	
+	datum_protocol_init_wake();
 	// Connect concurrently so local work remains available while the pool becomes ready.
 	if (datum_config.datum_pool_host[0] != 0) {
 		datum_protocol_start_connector();
@@ -248,6 +259,10 @@ int main(const int argc, const char * const * const argv) {
 	}
 	
 	DLOG_DEBUG("Starting template fetcher thread");
+	datum_stratum_init_empty_wake();
+	datum_blocktemplates_init_wake();
+	datum_blocktemplates_init_empty_wake();
+	datum_coinbaser_init_wake();
 	datum_thread_create(&pthread_datum_gateway_template, datum_gateway_template_thread, NULL);
 	
 	// Note: The stratum thread will wait for a template to be available for some time before panicking.
